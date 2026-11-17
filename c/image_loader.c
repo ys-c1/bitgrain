@@ -15,6 +15,23 @@
 #pragma GCC diagnostic pop
 #endif
 
+/* PGM is inherently grayscale: loading it as RGB would expand every sample
+ * to three identical channels, so a .pgm input could never round-trip back
+ * to .pgm (the CLI writer only emits PGM for 1-channel content). Refuse it
+ * in the RGB/RGBA loaders so the caller's existing grayscale fallback runs.
+ * Detected by extension (path API) or the "P5" magic (memory API). */
+static int path_is_pgm(const char *path)
+{
+    if (!path) return 0;
+    const char *dot = strrchr(path, '.');
+    return dot && strcasecmp(dot, ".pgm") == 0;
+}
+
+static int mem_is_pgm(const uint8_t *mem, size_t mem_size)
+{
+    return mem && mem_size >= 2 && mem[0] == 'P' && mem[1] == '5';
+}
+
 /* ------------------------------------------------------------------ */
 /* Stream reader                                                        */
 /* ------------------------------------------------------------------ */
@@ -75,6 +92,7 @@ uint8_t *bitgrain_load_rgb(const char *path,
                            uint32_t *out_width,
                            uint32_t *out_height)
 {
+    if (path_is_pgm(path)) return NULL;
     const char *dot = strrchr(path, '.');
     if (dot && strcasecmp(dot, ".webp") == 0) {
         uint8_t *data = bitgrain_load_webp_rgb(path, out_width, out_height);
@@ -91,6 +109,7 @@ uint8_t *bitgrain_load_rgb(const char *path,
 uint8_t *bitgrain_load_rgb_mem(const uint8_t *mem, size_t mem_size,
                                 uint32_t *out_width, uint32_t *out_height)
 {
+    if (mem_is_pgm(mem, mem_size)) return NULL;
     int w, h, n;
     unsigned char *data = stbi_load_from_memory(mem, (int)mem_size, &w, &h, &n, 3);
     if (!data || w <= 0 || h <= 0) { stbi_image_free(data); return NULL; }
@@ -107,6 +126,7 @@ uint8_t *bitgrain_load_rgba(const char *path,
                             uint32_t *out_width,
                             uint32_t *out_height)
 {
+    if (path_is_pgm(path)) return NULL;
     const char *dot = strrchr(path, '.');
     if (dot && strcasecmp(dot, ".webp") == 0) {
         uint8_t *data = bitgrain_load_webp_rgba(path, out_width, out_height);
@@ -123,6 +143,7 @@ uint8_t *bitgrain_load_rgba(const char *path,
 uint8_t *bitgrain_load_rgba_mem(const uint8_t *mem, size_t mem_size,
                                  uint32_t *out_width, uint32_t *out_height)
 {
+    if (mem_is_pgm(mem, mem_size)) return NULL;
     int w, h, n;
     unsigned char *data = stbi_load_from_memory(mem, (int)mem_size, &w, &h, &n, 4);
     if (!data || w <= 0 || h <= 0) { stbi_image_free(data); return NULL; }
