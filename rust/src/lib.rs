@@ -9,6 +9,8 @@ pub mod entropy;
 pub mod ffi;
 pub mod huffman;
 mod jpeg_luma_ac_ht;
+#[cfg(test)]
+mod qtable_sharing;
 pub mod zigzag;
 
 #[cfg(test)]
