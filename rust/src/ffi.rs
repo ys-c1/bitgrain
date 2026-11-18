@@ -17,6 +17,36 @@ extern "C" {
     pub fn bitgrain_idct_block(block: *mut i16);
 }
 
+// Test-only stubs for the C SIMD quant kernels (c/quant.c) so `cargo test`
+// links without the C objects. Semantics match the SSE2/AVX2 paths exactly:
+// quantize = round-to-nearest-even(b / t) saturated to i16 (cvtps_epi32 +
+// packs_epi32); dequantize = saturating b * t. Never compiled into the
+// shipped static/shared library (those link the real C kernels).
+#[cfg(test)]
+mod c_kernel_stubs {
+    #[no_mangle]
+    pub extern "C" fn quantize_block(block: *mut i16, table: *const i16) {
+        unsafe {
+            for i in 0..64 {
+                let b = *block.add(i) as f32;
+                let t = *table.add(i) as f32;
+                let q = (b / t).round_ties_even() as i32;
+                *block.add(i) = q.clamp(-32768, 32767) as i16;
+            }
+        }
+    }
+
+    #[no_mangle]
+    pub extern "C" fn dequantize_block(block: *mut i16, table: *const i16) {
+        unsafe {
+            for i in 0..64 {
+                let v = *block.add(i) as i32 * *table.add(i) as i32;
+                *block.add(i) = v.clamp(-32768, 32767) as i16;
+            }
+        }
+    }
+}
+
 static RAYON_THREADS_CONFIGURED: AtomicUsize = AtomicUsize::new(0);
 
 const BITGRAIN_OK: i32 = 0;

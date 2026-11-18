@@ -66,6 +66,28 @@ For each plane:
 
 The decoder uses the per-plane length to jump exactly to the next plane boundary.
 
+### Arithmetic path (v20/v21)
+
+v20 (RGB) and v21 (RGBA) use the same header, plane layout, quantization and
+coefficient walk as v18/v19, but the plane payload is entropy-coded with a
+zero-order adaptive arithmetic coder instead of static Huffman tables:
+
+1. 4-byte little-endian plane payload length (same framing as Huffman planes).
+2. Arithmetic-coded payload (MSB-first bit packing, **no** 0xFF byte-stuffing).
+3. Final plane flush pads the last byte with 0 bits.
+
+One independent adaptive order-0 model per symbol class (luma DC, chroma DC,
+luma AC, chroma AC); frequencies start at 1, increment by 16 per symbol and
+are halved when the total exceeds 2^14. Raw magnitude bits use a fixed
+uniform binary model. The coder is a 32-bit Witten–Neal–Cleary arithmetic
+coder with E1/E2/E3 renormalization; the symbol count is known from the
+block count, so no explicit termination symbol is stored.
+
+The encoder selects the entropy backend with the `BITGRAIN_ENTROPY`
+environment variable: `huffman` (default, writes v18/v19), `arith`
+(writes v20/v21), or `legacy` (pre-interface hardcoded Huffman path,
+byte-identical to `huffman`). The public C API is unchanged.
+
 ## Quantization
 
 Quality maps to scaled JPEG-like quantization tables (luma and chroma). Newer versions apply increasingly perceptual weighting profiles to close file-size gap versus JPEG.

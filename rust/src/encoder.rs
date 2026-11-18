@@ -1,13 +1,17 @@
+use crate::arith::ArithEncoder;
 use crate::bitstream;
 use crate::block::Block;
 use crate::blockizer::Blockizer;
 use crate::colorspace;
 use crate::dct;
 use crate::entropy;
+use crate::entropy_coder::{encode_plane_walk, EntropyEncoder};
 use crate::ffi::quantize_block;
 use crate::huffman;
+use crate::huffman::HuffmanEncoder;
 use crate::zigzag::ZIGZAG;
 use rayon::prelude::*;
+use std::sync::OnceLock;
 const BLOCK_TILE_SIZE: usize = 512;
 const PARALLEL_BLOCKS_THRESHOLD: usize = 384;
 const PARALLEL_PLANE_PIXELS_THRESHOLD: usize = 262_144;
@@ -53,6 +57,64 @@ const BG_MAGIC_RGB:     &[u8; 3] = b"BG\x02";
 const BG_MAGIC_RGBA:    &[u8; 3] = b"BG\x03";
 const BG_MAGIC_YUV420_V8:  &[u8; 3] = b"BG\x12";
 const BG_MAGIC_YUV420A_V8: &[u8; 3] = b"BG\x13";
+const BG_MAGIC_YUV420_ARITH:  &[u8; 3] = b"BG\x14"; // v20: v18 layout, arithmetic entropy
+const BG_MAGIC_YUV420A_ARITH: &[u8; 3] = b"BG\x15"; // v21: v19 layout, arithmetic entropy
+
+// ---------------------------------------------------------------------------
+// Entropy backend selection
+// ---------------------------------------------------------------------------
+
+/// Which entropy backend the encoder routes its symbol stream through.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EntropyKind {
+    /// Original hardcoded Huffman path (pre-interface reference).
+    Legacy,
+    /// Static JPEG-table Huffman via the EntropyEncoder interface.
+    /// Byte-identical to `Legacy` (default).
+    Huffman,
+    /// Zero-order adaptive arithmetic coder (writes .bg v20/v21).
+    Arith,
+}
+
+/// Backend switch: `BITGRAIN_ENTROPY=legacy|huffman|arith` (default `huffman`).
+/// Read once per process; the public API is unchanged.
+pub fn entropy_kind_from_env() -> EntropyKind {
+    static KIND: OnceLock<EntropyKind> = OnceLock::new();
+    *KIND.get_or_init(|| match std::env::var("BITGRAIN_ENTROPY").as_deref() {
+        Ok("legacy") => EntropyKind::Legacy,
+        Ok("arith") | Ok("arithmetic") => EntropyKind::Arith,
+        Ok("huffman") | Ok("huff") => EntropyKind::Huffman,
+        _ => EntropyKind::Huffman,
+    })
+}
+
+/// Encode one plane of quantized/clamped blocks with the selected backend.
+/// `Legacy` and `Huffman` produce identical bytes.
+fn encode_plane_with_kind(
+    kind: EntropyKind,
+    blocks: &[Block],
+    is_chroma: bool,
+    use_chroma_ac: bool,
+    use_dc_delta: bool,
+) -> Vec<u8> {
+    match kind {
+        EntropyKind::Legacy => {
+            huffman::encode_plane_with_profile(blocks, is_chroma, use_chroma_ac, use_dc_delta)
+        }
+        EntropyKind::Huffman => {
+            let mut enc = HuffmanEncoder::new();
+            enc.init();
+            encode_plane_walk(&mut enc, blocks, is_chroma, use_chroma_ac, use_dc_delta);
+            enc.finish()
+        }
+        EntropyKind::Arith => {
+            let mut enc = ArithEncoder::new();
+            enc.init();
+            encode_plane_walk(&mut enc, blocks, is_chroma, use_chroma_ac, use_dc_delta);
+            enc.finish()
+        }
+    }
+}
 
 /// Standard JPEG luminance quantization table (quality ~50).
 pub fn default_quant_table() -> [i16; 64] {
@@ -416,7 +478,8 @@ pub fn encode_grayscale(
 // Huffman + YCbCr 4:2:0 path (v4/v5) — best compression
 // ---------------------------------------------------------------------------
 
-/// Encode blocks with Huffman into a Vec<u8>. Parallel DCT+quant, sequential Huffman.
+/// Encode blocks into a Vec<u8>. Parallel DCT+quant, sequential entropy coding
+/// through the selected backend.
 fn encode_channel_huffman(
     blocks: &mut [Block],
     table: &[i16; 64],
@@ -426,6 +489,7 @@ fn encode_channel_huffman(
     use_chroma_ac: bool,
     use_dc_delta: bool,
     sparsify_thresholds: Option<&[i16; 64]>,
+    kind: EntropyKind,
 ) -> Vec<u8> {
     if should_parallel_blocks(blocks.len(), plane_w, plane_h) {
         blocks.par_chunks_mut(BLOCK_TILE_SIZE).for_each(|chunk| {
@@ -448,16 +512,26 @@ fn encode_channel_huffman(
             huffman::clamp_block_jpeg_coeffs(block);
         }
     }
-    huffman::encode_plane_with_profile(blocks, is_chroma, use_chroma_ac, use_dc_delta)
+    encode_plane_with_kind(kind, blocks, is_chroma, use_chroma_ac, use_dc_delta)
 }
 
-/// Encode RGB image using YCbCr 4:2:0 + Huffman (version 4).
+/// Encode RGB image using YCbCr 4:2:0 + entropy backend (version 18/20).
 /// This is the recommended path for RGB images — best compression ratio.
 pub fn encode_rgb_ycbcr(
     image: &[u8], width: usize, height: usize, quality: u8,
     out: &mut [u8], pos: &mut i32, icc: Option<&[u8]>,
 ) {
-    write_header(out, pos, BG_MAGIC_YUV420_V8, width, height, quality);
+    encode_rgb_ycbcr_kind(image, width, height, quality, out, pos, icc, entropy_kind_from_env());
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_rgb_ycbcr_kind(
+    image: &[u8], width: usize, height: usize, quality: u8,
+    out: &mut [u8], pos: &mut i32, icc: Option<&[u8]>,
+    kind: EntropyKind,
+) {
+    let magic = if kind == EntropyKind::Arith { BG_MAGIC_YUV420_ARITH } else { BG_MAGIC_YUV420_V8 };
+    write_header(out, pos, magic, width, height, quality);
 
     let (y, cb, cr) = colorspace::rgb_to_ycbcr420(image, width, height);
     let cw = (width  + 1) / 2;
@@ -476,17 +550,17 @@ pub fn encode_rgb_ycbcr(
         let (y_buf, (cb_buf, cr_buf)) = rayon::join(
             || {
                 let mut blocks = blockizer_full.generate_blocks(&y);
-                encode_channel_huffman(&mut blocks, &luma_table, width, height, false, false, true, Some(&luma_sparsify))
+                encode_channel_huffman(&mut blocks, &luma_table, width, height, false, false, true, Some(&luma_sparsify), kind)
             },
             || {
                 rayon::join(
                     || {
                         let mut blocks = blockizer_chroma.generate_blocks(&cb);
-                        encode_channel_huffman(&mut blocks, &chroma_table, cw, ch, true, true, true, Some(&chroma_sparsify))
+                        encode_channel_huffman(&mut blocks, &chroma_table, cw, ch, true, true, true, Some(&chroma_sparsify), kind)
                     },
                     || {
                         let mut blocks = blockizer_chroma.generate_blocks(&cr);
-                        encode_channel_huffman(&mut blocks, &chroma_table, cw, ch, true, true, true, Some(&chroma_sparsify))
+                        encode_channel_huffman(&mut blocks, &chroma_table, cw, ch, true, true, true, Some(&chroma_sparsify), kind)
                     },
                 )
             },
@@ -494,11 +568,11 @@ pub fn encode_rgb_ycbcr(
         (y_buf, cb_buf, cr_buf)
     } else {
         let mut yb = blockizer_full.generate_blocks(&y);
-        let y_buf = encode_channel_huffman(&mut yb, &luma_table, width, height, false, false, true, Some(&luma_sparsify));
+        let y_buf = encode_channel_huffman(&mut yb, &luma_table, width, height, false, false, true, Some(&luma_sparsify), kind);
         let mut cbb = blockizer_chroma.generate_blocks(&cb);
-        let cb_buf = encode_channel_huffman(&mut cbb, &chroma_table, cw, ch, true, true, true, Some(&chroma_sparsify));
+        let cb_buf = encode_channel_huffman(&mut cbb, &chroma_table, cw, ch, true, true, true, Some(&chroma_sparsify), kind);
         let mut crb = blockizer_chroma.generate_blocks(&cr);
-        let cr_buf = encode_channel_huffman(&mut crb, &chroma_table, cw, ch, true, true, true, Some(&chroma_sparsify));
+        let cr_buf = encode_channel_huffman(&mut crb, &chroma_table, cw, ch, true, true, true, Some(&chroma_sparsify), kind);
         (y_buf, cb_buf, cr_buf)
     };
 
@@ -508,12 +582,22 @@ pub fn encode_rgb_ycbcr(
     write_icc_trailer(out, pos, icc);
 }
 
-/// Encode RGBA image using YCbCr 4:2:0 + Huffman + full-res alpha (version 5).
+/// Encode RGBA image using YCbCr 4:2:0 + entropy backend + full-res alpha (version 19/21).
 pub fn encode_rgba_ycbcr(
     image: &[u8], width: usize, height: usize, quality: u8,
     out: &mut [u8], pos: &mut i32, icc: Option<&[u8]>,
 ) {
-    write_header(out, pos, BG_MAGIC_YUV420A_V8, width, height, quality);
+    encode_rgba_ycbcr_kind(image, width, height, quality, out, pos, icc, entropy_kind_from_env());
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_rgba_ycbcr_kind(
+    image: &[u8], width: usize, height: usize, quality: u8,
+    out: &mut [u8], pos: &mut i32, icc: Option<&[u8]>,
+    kind: EntropyKind,
+) {
+    let magic = if kind == EntropyKind::Arith { BG_MAGIC_YUV420A_ARITH } else { BG_MAGIC_YUV420A_V8 };
+    write_header(out, pos, magic, width, height, quality);
 
     let (y, cb, cr, a) = colorspace::rgba_to_ycbcr420a(image, width, height);
     let cw = (width  + 1) / 2;
@@ -533,11 +617,11 @@ pub fn encode_rgba_ycbcr(
                 rayon::join(
                     || {
                         let mut blocks = blockizer_full.generate_blocks(&y);
-                        encode_channel_huffman(&mut blocks, &luma_table, width, height, false, false, true, Some(&luma_sparsify))
+                        encode_channel_huffman(&mut blocks, &luma_table, width, height, false, false, true, Some(&luma_sparsify), kind)
                     },
                     || {
                         let mut blocks = blockizer_full.generate_blocks(&a);
-                        encode_channel_huffman(&mut blocks, &luma_table, width, height, false, false, true, Some(&luma_sparsify))
+                        encode_channel_huffman(&mut blocks, &luma_table, width, height, false, false, true, Some(&luma_sparsify), kind)
                     },
                 )
             },
@@ -545,11 +629,11 @@ pub fn encode_rgba_ycbcr(
                 rayon::join(
                     || {
                         let mut blocks = blockizer_chroma.generate_blocks(&cb);
-                        encode_channel_huffman(&mut blocks, &chroma_table, cw, ch, true, true, true, Some(&chroma_sparsify))
+                        encode_channel_huffman(&mut blocks, &chroma_table, cw, ch, true, true, true, Some(&chroma_sparsify), kind)
                     },
                     || {
                         let mut blocks = blockizer_chroma.generate_blocks(&cr);
-                        encode_channel_huffman(&mut blocks, &chroma_table, cw, ch, true, true, true, Some(&chroma_sparsify))
+                        encode_channel_huffman(&mut blocks, &chroma_table, cw, ch, true, true, true, Some(&chroma_sparsify), kind)
                     },
                 )
             },
@@ -557,13 +641,13 @@ pub fn encode_rgba_ycbcr(
         (y_buf, cb_buf, cr_buf, a_buf)
     } else {
         let mut yb = blockizer_full.generate_blocks(&y);
-        let y_buf = encode_channel_huffman(&mut yb, &luma_table, width, height, false, false, true, Some(&luma_sparsify));
+        let y_buf = encode_channel_huffman(&mut yb, &luma_table, width, height, false, false, true, Some(&luma_sparsify), kind);
         let mut cbb = blockizer_chroma.generate_blocks(&cb);
-        let cb_buf = encode_channel_huffman(&mut cbb, &chroma_table, cw, ch, true, true, true, Some(&chroma_sparsify));
+        let cb_buf = encode_channel_huffman(&mut cbb, &chroma_table, cw, ch, true, true, true, Some(&chroma_sparsify), kind);
         let mut crb = blockizer_chroma.generate_blocks(&cr);
-        let cr_buf = encode_channel_huffman(&mut crb, &chroma_table, cw, ch, true, true, true, Some(&chroma_sparsify));
+        let cr_buf = encode_channel_huffman(&mut crb, &chroma_table, cw, ch, true, true, true, Some(&chroma_sparsify), kind);
         let mut ab = blockizer_full.generate_blocks(&a);
-        let a_buf = encode_channel_huffman(&mut ab, &luma_table, width, height, false, false, true, Some(&luma_sparsify));
+        let a_buf = encode_channel_huffman(&mut ab, &luma_table, width, height, false, false, true, Some(&luma_sparsify), kind);
         (y_buf, cb_buf, cr_buf, a_buf)
     };
 

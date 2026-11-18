@@ -9,6 +9,7 @@
 //! A single flush (pad with 1s) is written at the end of each plane.
 
 use crate::block::Block;
+use crate::entropy_coder::{category, magnitude_bits, magnitude_decode, EntropyEncoder, SymClass};
 use crate::zigzag::ZIGZAG;
 
 // ---------------------------------------------------------------------------
@@ -238,23 +239,9 @@ fn ac_tree(use_chroma_ac: bool) -> &'static DecodeTree {
 // ---------------------------------------------------------------------------
 // Magnitude helpers
 // ---------------------------------------------------------------------------
-
-#[inline]
-fn category(v: i16) -> u8 {
-    if v == 0 { return 0; }
-    (16 - v.unsigned_abs().leading_zeros()) as u8
-}
-
-#[inline]
-fn magnitude_bits(v: i16, cat: u8) -> u16 {
-    if v >= 0 { v as u16 } else { ((1u16 << cat) - 1).wrapping_add(v as u16) }
-}
-
-#[inline]
-fn magnitude_decode(bits: u16, cat: u8) -> i16 {
-    let threshold = 1u16 << (cat - 1);
-    if bits >= threshold { bits as i16 } else { bits as i16 - (1i16 << cat) + 1 }
-}
+//
+// `category`, `magnitude_bits` and `magnitude_decode` now live in
+// `entropy_coder` (shared by all entropy backends) and are imported above.
 
 /// JPEG-style DC/AC Huffman tables only cover DC category ≤11 and AC category ≤10.
 /// Without this clamp, `encode_plane` can hit the `al == 0` fallback and emit a bitstream
@@ -691,5 +678,75 @@ fn decode_plane_blocks(
     }
 
     Some(blocks)
+}
+
+// ---------------------------------------------------------------------------
+// EntropyEncoder backend — interface adapter around the static JPEG tables
+// ---------------------------------------------------------------------------
+
+/// Static JPEG-table Huffman backend. Uses the same tables, bit writer and
+/// emission order as the legacy hardcoded `encode_plane_with_profile`, so the
+/// produced plane bytes are identical; it only goes through the
+/// [`EntropyEncoder`] interface (`init` / `encode_symbol` / `finish`).
+///
+/// The 4-byte plane-length prefix is reserved in `init` and patched in place
+/// by `finish`, so unlike the legacy path no copy of the plane buffer is made.
+/// Table references are resolved once in `init` (not per symbol), matching the
+/// legacy path's register-cached locals.
+pub struct HuffmanEncoder {
+    w: BitWriter,
+    ac_luma: &'static AcTable,
+    ac_chroma: &'static AcTable,
+}
+
+impl HuffmanEncoder {
+    pub fn new() -> Self {
+        Self { w: BitWriter::new(), ac_luma: jpeg_ac_table(), ac_chroma: jpeg_chroma_ac_table() }
+    }
+}
+
+impl EntropyEncoder for HuffmanEncoder {
+    fn init(&mut self) {
+        self.w.buf.clear();
+        self.w.bit_buf = 0;
+        self.w.bits_in = 0;
+        self.w.buf.extend_from_slice(&[0, 0, 0, 0]); // length prefix, patched in finish
+        self.ac_luma = jpeg_ac_table();
+        self.ac_chroma = jpeg_chroma_ac_table();
+    }
+
+    #[inline]
+    fn encode_symbol(&mut self, class: SymClass, sym: u8) {
+        let (len, code) = match class {
+            SymClass::DcLuma => LUMA_DC_TABLE.get(sym as usize).copied().unwrap_or((0, 0)),
+            SymClass::DcChroma => CHROMA_DC_TABLE.get(sym as usize).copied().unwrap_or((0, 0)),
+            SymClass::AcLuma => self.ac_luma[sym as usize],
+            SymClass::AcChroma => self.ac_chroma[sym as usize],
+        };
+        if len == 0 {
+            // Unreachable after clamp_block_jpeg_coeffs; the legacy path wrote
+            // the EOB code of the selected AC table in this case.
+            let (el, ec) = if class == SymClass::AcChroma {
+                self.ac_chroma[0x00]
+            } else {
+                self.ac_luma[0x00]
+            };
+            self.w.write_bits(ec, el);
+            return;
+        }
+        self.w.write_bits(code, len);
+    }
+
+    #[inline]
+    fn encode_raw_bits(&mut self, bits: u16, n: u8) {
+        self.w.write_bits(bits, n);
+    }
+
+    fn finish(&mut self) -> Vec<u8> {
+        self.w.flush();
+        let len = (self.w.buf.len() - 4) as u32;
+        self.w.buf[0..4].copy_from_slice(&len.to_le_bytes());
+        std::mem::take(&mut self.w.buf)
+    }
 }
 

@@ -2,6 +2,28 @@
 
 All notable changes to this project are documented in this file.
 
+## [Unreleased]
+
+### Added
+- Pluggable entropy-coding interface (`entropy_coder`): the encoder drives
+  any backend through `init` / `encode_symbol` / `finish`; the coefficient
+  walk is shared and monomorphized per plane class (zero per-symbol dispatch
+  cost, no buffer copies across the interface).
+- Zero-order adaptive arithmetic coding backend (`arith`), selectable with
+  `BITGRAIN_ENTROPY=arith`; writes new stream versions 20 (RGB) / 21 (RGBA),
+  decodable by `bitgrain_decode` like any other version.
+- `BITGRAIN_ENTROPY` backend switch: `huffman` (default, byte-identical to
+  the previous hardcoded path), `legacy` (pre-interface reference path),
+  `arith`.
+- Format spec: documented the v20/v21 arithmetic plane payload (FORMAT.md).
+- Tests: byte-exact legacy-vs-interface equality, arithmetic round-trips,
+  cross-backend pixel equality, and a 100 MiB benchmark
+  (`cargo test --release -- --ignored --nocapture entropy_bench_100mb`).
+
+### Changed
+- Plane length prefixes are now reserved up front and patched in place,
+  removing the per-plane buffer copy in the Huffman path.
+
 ## [2.0.0] - 2026-04-26
 
 ### Added

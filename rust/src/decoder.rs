@@ -20,6 +20,7 @@
 //!  v18: YCbCr 4:2:0, ultra perceptual + AC sparsify + chroma AC + DC delta → RGB output
 //!  v19: YCbCr 4:2:0 + A, ultra perceptual + AC sparsify + chroma AC + DC delta → RGBA output
 
+use crate::arith;
 use crate::block::Block;
 use crate::colorspace;
 use crate::dct;
@@ -177,12 +178,31 @@ fn decode_plane_huffman(
     use_dc_delta: bool,
     plane: &mut [u8],
 ) -> Option<usize> {
+    decode_plane_entropy(buffer, pos, w, h, quant, is_chroma, use_chroma_ac, use_dc_delta, false, plane)
+}
+
+/// Decode one plane with the selected entropy backend, dequant+IDCT in
+/// parallel, write to flat plane buffer.
+#[allow(clippy::too_many_arguments)]
+fn decode_plane_entropy(
+    buffer: &[u8], pos: usize,
+    w: usize, h: usize,
+    quant: &[i16; 64],
+    is_chroma: bool,
+    use_chroma_ac: bool,
+    use_dc_delta: bool,
+    use_arith: bool,
+    plane: &mut [u8],
+) -> Option<usize> {
     let bw = (w + 7) / 8;
     let bh = (h + 7) / 8;
     let n  = bw * bh;
 
-    let (mut blocks, new_pos) =
-        huffman::decode_plane_with_profile(buffer, pos, n, is_chroma, use_chroma_ac, use_dc_delta)?;
+    let (mut blocks, new_pos) = if use_arith {
+        arith::decode_plane_arith(buffer, pos, n, is_chroma, use_chroma_ac, use_dc_delta)?
+    } else {
+        huffman::decode_plane_with_profile(buffer, pos, n, is_chroma, use_chroma_ac, use_dc_delta)?
+    };
 
     // Parallel dequant + IDCT
     if should_parallel_dequant(n, w, h) {
@@ -283,7 +303,7 @@ pub fn decode(
     }
 
     let version = buffer[2];
-    if version == 0 || version > 19 {
+    if version == 0 || version > 21 {
         return false;
     }
 
@@ -819,6 +839,66 @@ pub fn decode(
         pos = match decode_plane_huffman(buffer, pos, cw, ch, &chroma_q, true,  true,  true, &mut cb_plane) { Some(p) => p, None => return false };
         pos = match decode_plane_huffman(buffer, pos, cw, ch, &chroma_q, true,  true,  true, &mut cr_plane) { Some(p) => p, None => return false };
         pos = match decode_plane_huffman(buffer, pos, w,  h,  &luma_q,   false, false, true, &mut a_plane)  { Some(p) => p, None => return false };
+
+        colorspace::ycbcr420a_to_rgba(&y_plane, &cb_plane, &cr_plane, &a_plane, w, h, out_pixels);
+
+        if let Some(v) = out_icc {
+            if let Some((icc, _)) = parse_icc_trailer(buffer, pos) { *v = icc; }
+        }
+        return true;
+    }
+
+    // ---- v20: YCbCr 4:2:0 + zero-order arithmetic entropy (v18 layout) → RGB ----
+    if version == 20 {
+        if out_pixels.len() < w * h * 3 {
+            return false;
+        }
+        *out_width = width; *out_height = height; *out_channels = 3;
+
+        let cw = (w + 1) / 2;
+        let ch = (h + 1) / 2;
+        let luma_q   = encoder::quant_table_for_quality_perceptual_v4(q);
+        let chroma_q = encoder::chroma_quant_table_for_quality_perceptual_v4(q);
+
+        let mut y_plane  = vec![0u8; w * h];
+        let mut cb_plane = vec![0u8; cw * ch];
+        let mut cr_plane = vec![0u8; cw * ch];
+
+        let mut pos = header_size;
+        pos = match decode_plane_entropy(buffer, pos, w,  h,  &luma_q,   false, false, true, true, &mut y_plane)  { Some(p) => p, None => return false };
+        pos = match decode_plane_entropy(buffer, pos, cw, ch, &chroma_q, true,  true,  true, true, &mut cb_plane) { Some(p) => p, None => return false };
+        pos = match decode_plane_entropy(buffer, pos, cw, ch, &chroma_q, true,  true,  true, true, &mut cr_plane) { Some(p) => p, None => return false };
+
+        colorspace::ycbcr420_to_rgb(&y_plane, &cb_plane, &cr_plane, w, h, out_pixels);
+
+        if let Some(v) = out_icc {
+            if let Some((icc, _)) = parse_icc_trailer(buffer, pos) { *v = icc; }
+        }
+        return true;
+    }
+
+    // ---- v21: YCbCr 4:2:0 + A + zero-order arithmetic entropy (v19 layout) → RGBA ----
+    if version == 21 {
+        if out_pixels.len() < w * h * 4 {
+            return false;
+        }
+        *out_width = width; *out_height = height; *out_channels = 4;
+
+        let cw = (w + 1) / 2;
+        let ch = (h + 1) / 2;
+        let luma_q   = encoder::quant_table_for_quality_perceptual_v4(q);
+        let chroma_q = encoder::chroma_quant_table_for_quality_perceptual_v4(q);
+
+        let mut y_plane  = vec![0u8; w * h];
+        let mut cb_plane = vec![0u8; cw * ch];
+        let mut cr_plane = vec![0u8; cw * ch];
+        let mut a_plane  = vec![0u8; w * h];
+
+        let mut pos = header_size;
+        pos = match decode_plane_entropy(buffer, pos, w,  h,  &luma_q,   false, false, true, true, &mut y_plane)  { Some(p) => p, None => return false };
+        pos = match decode_plane_entropy(buffer, pos, cw, ch, &chroma_q, true,  true,  true, true, &mut cb_plane) { Some(p) => p, None => return false };
+        pos = match decode_plane_entropy(buffer, pos, cw, ch, &chroma_q, true,  true,  true, true, &mut cr_plane) { Some(p) => p, None => return false };
+        pos = match decode_plane_entropy(buffer, pos, w,  h,  &luma_q,   false, false, true, true, &mut a_plane)  { Some(p) => p, None => return false };
 
         colorspace::ycbcr420a_to_rgba(&y_plane, &cb_plane, &cr_plane, &a_plane, w, h, out_pixels);
 
