@@ -1,7 +1,7 @@
 use crate::block::Block;
 use crate::huffman::{
     clamp_block_jpeg_coeffs, decode_plane, decode_plane_with_ac, decode_plane_with_profile, encode_plane,
-    encode_plane_with_ac, encode_plane_with_profile,
+    encode_plane_with_ac, encode_plane_with_period, encode_plane_with_profile,
 };
 use crate::zigzag::ZIGZAG;
 
@@ -143,5 +143,114 @@ fn huffman_roundtrip_dc_delta_profile() {
         decode_plane_with_profile(&encoded, 0, blocks.len(), false, false, true).expect("dc-delta decode");
     for (i, (orig, dec)) in blocks.iter().zip(decoded.iter()).enumerate() {
         assert_eq!(orig.data, dec.data, "dc-delta mismatch in block {i}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Adaptive arithmetic coder tests
+// ---------------------------------------------------------------------------
+
+fn lcg_blocks(n: usize, seed: &mut u64) -> Vec<Block> {
+    fn next(state: &mut u64) -> u32 {
+        *state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (*state >> 32) as u32
+    }
+    let mut blocks = Vec::with_capacity(n);
+    for _ in 0..n {
+        let mut b = Block::new();
+        b.data[ZIGZAG[0]] = (next(seed) % 4095) as i16 - 2047;
+        for zi in 1..64 {
+            if next(seed) % 100 < 65 {
+                b.data[ZIGZAG[zi]] = 0;
+            } else {
+                b.data[ZIGZAG[zi]] = (next(seed) % 2047) as i16 - 1023;
+            }
+        }
+        blocks.push(b);
+    }
+    blocks
+}
+
+#[test]
+fn arith_roundtrip_period_1() {
+    let mut seed = 0xdead_beef_cafe_1234u64;
+    let blocks = lcg_blocks(512, &mut seed);
+    let encoded = encode_plane_with_period(&blocks, false, false, true, 1);
+    let (decoded, _) = decode_plane_with_profile(&encoded, 0, blocks.len(), false, false, true)
+        .expect("decode");
+    for (i, (o, d)) in blocks.iter().zip(decoded.iter()).enumerate() {
+        assert_eq!(o.data, d.data, "period 1 mismatch block {i}");
+    }
+}
+
+#[test]
+fn arith_roundtrip_period_0_static() {
+    let mut seed = 0x0bad_1dea_0bad_1deau64;
+    let blocks = lcg_blocks(512, &mut seed);
+    let encoded = encode_plane_with_period(&blocks, false, false, true, 0);
+    let (decoded, _) = decode_plane_with_profile(&encoded, 0, blocks.len(), false, false, true)
+        .expect("decode");
+    for (i, (o, d)) in blocks.iter().zip(decoded.iter()).enumerate() {
+        assert_eq!(o.data, d.data, "static-model mismatch block {i}");
+    }
+}
+
+#[test]
+fn arith_roundtrip_period_7() {
+    let mut seed = 0x1234_4321_5678_8765u64;
+    let blocks = lcg_blocks(1024, &mut seed);
+    let encoded = encode_plane_with_period(&blocks, false, false, true, 7);
+    let (decoded, _) = decode_plane_with_profile(&encoded, 0, blocks.len(), false, false, true)
+        .expect("decode");
+    for (i, (o, d)) in blocks.iter().zip(decoded.iter()).enumerate() {
+        assert_eq!(o.data, d.data, "period 7 mismatch block {i}");
+    }
+}
+
+#[test]
+fn arith_roundtrip_all_zero_and_extremes() {
+    for period in [0u8, 1, 3, 127] {
+        let mut blocks = vec![Block::new(); 4];
+        let mut extreme = Block::new();
+        extreme.data[ZIGZAG[0]] = i16::MIN + 1;
+        extreme.data[ZIGZAG[1]] = i16::MAX;
+        extreme.data[ZIGZAG[63]] = -1;
+        blocks.push(extreme);
+        let encoded = encode_plane_with_period(&blocks, false, false, true, period);
+        let (decoded, _) = decode_plane_with_profile(&encoded, 0, blocks.len(), false, false, true)
+            .expect("decode");
+        for (i, (o, d)) in blocks.iter().zip(decoded.iter()).enumerate() {
+            assert_eq!(o.data, d.data, "extreme mismatch period {period} block {i}");
+        }
+    }
+}
+
+#[test]
+fn arith_payload_has_magic_and_period() {
+    let block = make_block(&[(0, 7), (2, -3)]);
+    let encoded = encode_plane_with_period(&[block], false, false, false, 5);
+    assert_eq!(&encoded[4..8], b"ARIT");
+    assert_eq!(encoded[8], 1); // codec version
+    assert_eq!(encoded[9] & 0x7F, 5); // update period
+}
+
+#[test]
+fn legacy_huffman_payload_still_decodes() {
+    let mut seed = 0xfeed_face_0000_1111u64;
+    let mut blocks = lcg_blocks(300, &mut seed);
+    // The legacy Huffman tables only cover DC category ≤ 11 (|delta| ≤ 2047) and AC ≤ 1023.
+    // Keep DC within ±1023 so any delta between consecutive blocks stays representable.
+    for b in blocks.iter_mut() {
+        clamp_block_jpeg_coeffs(b);
+        b.data[ZIGZAG[0]] = b.data[ZIGZAG[0]].clamp(-1023, 1023);
+    }
+    for &(chroma, dc_delta) in &[(false, false), (false, true), (true, true)] {
+        let legacy = crate::huffman::legacy_encode_plane_with_profile(&blocks, chroma, chroma, dc_delta);
+        assert_ne!(&legacy[4..8], b"ARIT", "legacy payload should not carry the magic");
+        let (decoded, _) = decode_plane_with_profile(&legacy, 0, blocks.len(), chroma, chroma, dc_delta)
+            .expect("legacy decode");
+        for (i, (o, d)) in blocks.iter().zip(decoded.iter()).enumerate() {
+            assert_eq!(o.data, d.data, "legacy mismatch chroma={chroma} dc={dc_delta} block {i}");
+        }
     }
 }

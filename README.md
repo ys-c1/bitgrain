@@ -85,6 +85,17 @@ Versions:
 - `v16-v17`: very aggressive perceptual profile
 - `v18-v19`: ultra perceptual + AC sparsify profile (best compression in current branch)
 
+Entropy payload for `v4+` is now **adaptive arithmetic coding** (payload magic
+`ARIT`); streams written by ≤ 2.0.0 with Huffman payloads are still decoded.
+The payload layout, tokenisation, adaptive-model update rule, coder state
+machine and tail flush are specified in [FORMAT.md](FORMAT.md#adaptive-arithmetic-entropy-payload-arit).
+The model update period is configurable via `BITGRAIN_ARITH_UPDATE_PERIOD`
+(`0` = static models, `1` = update every symbol, `N` = fold every N symbols).
+
+Compare the two entropy coders locally (samples, sizes, pixel-equality and
+codec-only timings) with `./scripts/arith_bench.sh [quality]`; set
+`BITGRAIN_BASELINE` to a CLI built from the pre-arithmetic commit.
+
 ## C API
 
 `includes/encoder.h`.

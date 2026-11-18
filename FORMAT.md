@@ -55,16 +55,145 @@ Coefficients are in **zigzag order** (JPEG order):
 ...
 ```
 
-### Huffman path (v4+)
+### Entropy path (v4+)
 
-For each plane:
+Each plane is stored unpadded, immediately followed by the next plane:
 
-1. 4-byte little-endian plane payload length.
-2. Bitstream payload (MSB-first).
-3. Byte-stuffing `0xFF -> 0xFF 0x00` inside entropy payload.
-4. Final plane flush pads with 1s (JPEG convention).
+```
++-----------------------------+-----------------------------+-----
+| u32 LE plane_payload_len    | plane payload (len bytes)   | next
++-----------------------------+-----------------------------+-----
+```
 
-The decoder uses the per-plane length to jump exactly to the next plane boundary.
+The payload is one of two coders. Decoders MUST inspect the first four payload
+bytes and dispatch:
+
+- `"ARIT"` → adaptive arithmetic coding, specified in the next section (current
+  encoder output).
+- Anything else → legacy Huffman coding (specified under *Legacy Huffman
+  payload*). New encoders do not emit it, but readers should keep accepting
+  stream produced by bitgrain ≤ 2.0.0.
+
+The per-plane length lets a decoder jump exactly to the next plane boundary.
+
+## Adaptive Arithmetic Entropy Payload ("ARIT")
+
+The current encoder codes all coefficients of a plane with a bit-oriented
+arithmetic (range) coder driven by adaptive frequency models. The models are
+updated from the symbols actually coded, so the code length tracks each
+plane's real statistics instead of a fixed Huffman table.
+
+### Payload header
+
+| Offset | Size | Field   | Description |
+|--------|------|---------|-------------|
+| 0      | 4    | magic   | ASCII `ARIT` (`41 52 49 54`) |
+| 4      | 1    | version | Arithmetic payload version = `1` |
+| 5      | 1    | config  | bit 0–6: model update period; bit 7: reserved, MUST be 0 |
+| 6      | …    | body    | arithmetic-coded bitstream |
+
+### Block tokenisation
+
+Blocks are coded in raster order. For each 8×8 block, coefficients are visited
+in zigzag order (`ZIGZAG` below). All symbols go through the same arithmetic
+coder; the model chosen depends on the context listed.
+
+**DC (zigzag index 0).** If the stream version uses DC prediction (v10+), the
+coded value is `dc - prev_dc` (two's-complement `i16` arithmetic); otherwise it
+is `dc`. `prev_dc` starts at 0 and is updated to the current block's decoded
+`dc`.
+
+1. **DC category** `c`: `0` when the value is 0, else `1 + floor(log2(|v|))`.
+   Coded with a 17-symbol adaptive model, context `min(prev_dc_category, 3)`
+   (4 contexts; `prev_dc_category` starts at 0).
+2. If `c > 0`: the low `c-1` magnitude bits, as raw bits (`1/2` each).
+3. If `c > 0`: the sign bit, with one adaptive binary model per plane.
+
+Magnitude is reconstructed as `(1 << (c-1)) | low_bits`, then the sign applied.
+
+**AC (zigzag indices 1..63).**
+
+1. **Last non-zero index** `L` ∈ `0..63` (`0` = block has no AC). Coded with a
+   64-symbol adaptive model, context `bucket(prev_L)` with
+   `bucket(L) = 0` for `L=0`, `1` for `L∈1..3`, `2` for `L∈4..15`, `3` otherwise.
+2. For `zi` in `1..L`, a **non-zero flag**. Adaptive binary model, context
+   `band * 4 + min(run, 3)`, where `band = (zi-1) / 8` and `run` is the number
+   of consecutive zero coefficients immediately before `zi` (capped at 3).
+   Coefficients at `zi == L` are known non-zero and carry no flag.
+3. For each non-zero coefficient (including `zi == L`):
+   1. **Magnitude category** `c = floor(log2(|v|))` ∈ `0..15`. Adaptive
+      16-symbol model, context `band * 4 + min(prev_c, 3)` where `prev_c` is the
+      category of the previous non-zero coefficient in the same block (0 at
+      block start).
+   2. **Low magnitude bits:** the `c` low bits of `|v|` (the implicit top bit is
+      always 1 and is not coded), as raw bits (`1/2` each).
+   3. **Sign bit**, adaptive binary model shared by the plane.
+
+### Adaptive frequency models
+
+Every model starts with frequency 1 for each of its `N` symbols (`total = N`).
+After a symbol is coded:
+
+- **Update period `P = 0`** (config bits 0–6 = 0): static — frequencies never
+  change (uniform code).
+- **`P = 1`**: the symbol's frequency is incremented immediately.
+- **`P > 1`**: the symbol is counted in a pending bucket; whenever `P` symbols
+  have been coded through this model, all pending counts are added and cleared.
+- If `total > 32768` after an update, all frequencies are halved with
+  `f[i] = (f[i] + 1) / 2` (keeping every frequency ≥ 1 and the total bounded).
+
+Encoder and decoder apply the identical update **after** coding each symbol,
+so the model state stays in lock-step; nothing about the models is sent in the
+stream beyond `P`.
+
+### Arithmetic coder
+
+Standard 32-bit range coder with deferred underflow:
+
+- State: `low = 0`, `high = 0xFFFFFFFF`, `pending = 0`.
+- To code a sub-interval `[cum_low, cum_high)` of `total`:
+  `range = high - low + 1`, `high = low + range*cum_high/total - 1`,
+  `low = low + range*cum_low/total`, using integer division.
+- Renormalise while `high < 0x80000000` (emit 0), `low ≥ 0x80000000`
+  (emit 1, subtract `0x80000000`), or `low ≥ 0x40000000` and
+  `high < 0xC0000000` (increment `pending`, subtract `0x40000000`); each step
+  shifts `low` left and `high = (high << 1) | 1`, both masked to 32 bits.
+  Emitting a bit writes it then `pending` copies of its inverse.
+- **Raw bits** (probability 1/2) use `half = range >> 1`; a 0-bit sets
+  `high = low + half - 1`, a 1-bit sets `low += half`.
+- **Decoder** keeps a 32-bit `code` preloaded with the first 32 message bits.
+  It finds the symbol with `scaled = ((code - low + 1) * total - 1) / range`,
+  selects the symbol whose cumulative interval contains `scaled`, and mirrors
+  the same interval/renormalisation steps.
+
+### Tail flush and bit packing
+
+Bits are written MSB-first into bytes with no byte stuffing. At end of plane
+the encoder emits one disambiguation bit (0 if `low < 0x40000000`, else 1)
+followed by all pending underflow bits, then pads the final partial byte with
+zero bits. The decoder reads exactly `plane_payload_len` bytes and treats any
+bit past the end as 0; the encoder's zero padding makes this exact.
+
+A plane's payload always contains the arithmetic body even for an empty plane
+(`L = 0` for every block still codes one 64-symbol `last_nz` symbol per block);
+decoders MUST consume exactly `n_blocks` blocks.
+
+### Choosing the update period
+
+The encoder reads `BITGRAIN_ARITH_UPDATE_PERIOD` (integer, clamped to `0..127`,
+default `1`; invalid values fall back to `1` — `0` means static). The chosen
+value is written into the payload `config` byte, so decoding never depends on
+the environment used for encoding.
+
+## Legacy Huffman payload
+
+Kept for reading streams produced by bitgrain ≤ 2.0.0. Used by v4–v19
+JPEG Annex K tables: standard luminance DC table for Y and A,
+chrominance DC table for Cb/Cr, and the plain luminance AC table (or the
+chrominance AC table for versions that select it) for AC coefficients. The
+bitstream is continuous across all blocks of a plane, packed MSB-first, with
+`0xFF` stuffed as `0xFF 0x00`, and flushed once per plane padding with 1 bits.
+
 
 ## Quantization
 

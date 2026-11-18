@@ -1,12 +1,85 @@
-//! Static Huffman coding for DCT coefficients.
+//! Entropy layer for DCT coefficients.
 //!
-//! Uses the standard JPEG Huffman tables (ISO 10918-1 Annex K):
-//!   - Luma DC + full luminance AC for Y (and A); chroma DC for Cb/Cr; **same luminance AC** for
-//!     all AC planes so .bg v4/v5 matches historical bitgrain streams.
+//! # Current coder: adaptive binary/multi-symbol arithmetic coding
 //!
-//! The bitstream is packed MSB-first, continuous across all blocks in a plane.
-//! 0xFF bytes are stuffed as 0xFF 0x00 (JPEG convention).
-//! A single flush (pad with 1s) is written at the end of each plane.
+//! The encoder and decoder in this module implement a bit-oriented arithmetic (range) coder
+//! driven by per-plane adaptive frequency models. It replaces the historical static JPEG
+//! Huffman tables for the coefficient payload. The old Huffman decoder is retained below as a
+//! fallback so `.bg` files written by earlier releases still decode (see *Plane payload*).
+//!
+//! ## Why arithmetic coding
+//!
+//! Static Huffman spends whole code words per `(run, size)` symbol and cannot adapt to the
+//! actual statistics of one image/plane. The models here are updated from the symbols actually
+//! coded, with context (zigzag band, zero-run length, previous magnitude category, previous DC
+//! magnitude category), so skewed coefficient distributions cost close to their entropy.
+//!
+//! ## Coefficient tokenisation (lossless, per 8×8 block)
+//!
+//! For each block, in zigzag order:
+//!   1. `last_nz` ∈ 0..63: index of the last non-zero AC coefficient (0 = no AC). One adaptive
+//!      64-symbol model, context = bucket of the previous block's `last_nz`.
+//!   2. For `zi` in `1..last_nz` code a binary "non-zero" flag with an adaptive model,
+//!      context = `band(zi) * 4 + min(zero_run, 3)`, where `band(zi) = (zi - 1) / 8`.
+//!      The coefficient at `zi == last_nz` is known non-zero and has no flag.
+//!   3. Every non-zero coefficient (including `zi == last_nz`) is coded as:
+//!        - magnitude category `c = floor(log2(|v|))` (0 for |v| = 1) with an adaptive
+//!          16-symbol model, context = `band(zi) * 4 + min(prev_cat, 3)`;
+//!        - the `c` low magnitude bits as raw arithmetic bits (probability exactly 1/2;
+//!          the implicit top bit is not coded because it is always 1 for `c >= 1`);
+//!        - the sign with one adaptive binary model per plane.
+//!   4. DC is coded before the AC scan as a signed value (delta vs. the previous block's DC
+//!      when the profile uses DC prediction), with adaptive category/sign models and a category
+//!      context bucketed from the previous DC delta.
+//!
+//! The same driver (`process_block`) is instantiated for the encoder and the decoder; the
+//! decoder simply ignores the "known" symbol and uses the value returned by the arithmetic
+//! decoder, which makes both sides bit-symmetric by construction.
+//!
+//! ## Adaptive frequency models and the update period
+//!
+//! Every model starts uniform (frequency 1 per symbol). For a coded symbol, with update period
+//! `P`:
+//!   - `P == 0`: the model is **static** — frequencies never change (uniform code).
+//!   - `P == 1`: the symbol's frequency is incremented immediately after it is coded.
+//!   - `P > 1`: the symbol is counted in a pending bucket; every `P` symbols coded through that
+//!     model the pending counts are folded into the frequencies.
+//! After folding, if the total exceeds 32768 the table is rescaled with `f[i] = (f[i] + 1) / 2`
+//! (keeps every symbol codeable). Encoder and decoder perform the identical update after coding
+//! or decoding each symbol.
+//!
+//! The period is configurable through the environment variable `BITGRAIN_ARITH_UPDATE_PERIOD`
+//! (default 1, clamped to 0..127) and is stored in the stream, so decoding does not depend on
+//! the environment used for encoding.
+//!
+//! ## Plane payload (defines the new bitstream)
+//!
+//! Each plane keeps the historical framing: `[payload_len: u32 LE][payload]`. The payload is:
+//!
+//! ```text
+//! offset  size  field
+//! 0       4     magic "ARIT" (0x41 0x52 0x49 0x54)
+//! 4       1     codec version = 1
+//! 5       1     config: bit0..6 = update period (0 = static, 1..127), bit7 reserved = 0
+//! 6       ...   arithmetic-coded bitstream
+//! ```
+//!
+//! A payload without the `ARIT` magic is decoded with the legacy Huffman path below.
+//!
+//! ### Bitstream and tail flush
+//!
+//! The arithmetic coder emits bits MSB-first into bytes (no 0xFF stuffing). The final flush
+//! emits the disambiguating bit plus the outstanding underflow ("pending") bits, then pads the
+//! last partial byte with zero bits. The decoder reads exactly `payload_len` bytes and supplies
+//! zero bits past the end, which is the standard arithmetic-coder convention and matches the
+//! encoder's zero padding.
+//!
+//! # Legacy coder
+//!
+//! The historical path used the standard JPEG Huffman tables (ISO 10918-1 Annex K): luma DC +
+//! full luminance AC for Y (and A), chroma DC for Cb/Cr. Its bitstream is packed MSB-first,
+//! continuous across all blocks in a plane, with 0xFF byte stuffing and a final pad of 1s. It is
+//! kept read-only for compatibility.
 
 use crate::block::Block;
 use crate::zigzag::ZIGZAG;
@@ -240,12 +313,14 @@ fn ac_tree(use_chroma_ac: bool) -> &'static DecodeTree {
 // ---------------------------------------------------------------------------
 
 #[inline]
+#[allow(dead_code)] // used by the test-only legacy encoder
 fn category(v: i16) -> u8 {
     if v == 0 { return 0; }
     (16 - v.unsigned_abs().leading_zeros()) as u8
 }
 
 #[inline]
+#[allow(dead_code)] // used by the test-only legacy encoder
 fn magnitude_bits(v: i16, cat: u8) -> u16 {
     if v >= 0 { v as u16 } else { ((1u16 << cat) - 1).wrapping_add(v as u16) }
 }
@@ -490,12 +565,673 @@ fn decode_sym(reader: &mut BitReader, tree: &DecodeTree) -> Option<u8> {
 }
 
 // ---------------------------------------------------------------------------
+// Adaptive arithmetic coding (current entropy coder)
+// ---------------------------------------------------------------------------
+
+/// Magic prefix of an arithmetic-coded plane payload.
+const ARITH_MAGIC: [u8; 4] = *b"ARIT";
+/// Version of the arithmetic payload layout.
+const ARITH_CODEC_VERSION: u8 = 1;
+/// Magic (4) + version (1) + config (1).
+const ARITH_HEADER_SIZE: usize = 6;
+
+/// Default model update period (fold pending counts after every coded symbol).
+pub(crate) const DEFAULT_UPDATE_PERIOD: u8 = 1;
+/// Largest representable update period (config byte keeps bit 7 reserved).
+pub(crate) const MAX_UPDATE_PERIOD: u8 = 127;
+
+/// Read the model update period from the environment.
+///
+/// `BITGRAIN_ARITH_UPDATE_PERIOD` selects the fold cadence: `0` keeps the models static
+/// (uniform code, never updated), `1` updates after every symbol, `N` folds every N symbols.
+/// Missing or malformed values fall back to [`DEFAULT_UPDATE_PERIOD`]; values above
+/// [`MAX_UPDATE_PERIOD`] are clamped.
+pub(crate) fn arithmetic_update_period() -> u8 {
+    match std::env::var("BITGRAIN_ARITH_UPDATE_PERIOD") {
+        Ok(v) => match v.trim().parse::<u32>() {
+            Ok(n) => n.min(MAX_UPDATE_PERIOD as u32) as u8,
+            Err(_) => DEFAULT_UPDATE_PERIOD,
+        },
+        Err(_) => DEFAULT_UPDATE_PERIOD,
+    }
+}
+
+/// Upper bound of a frequency-table total before rescaling.
+const MODEL_MAX_TOTAL: u32 = 32768;
+
+/// Fixed-capacity adaptive frequency model.
+///
+/// `freq[..n]` holds the current frequencies (each ≥ 1); `pending[..n]` accumulates counts
+/// between folds when `period > 1`. The update rule is shared verbatim by the encoder and the
+/// decoder, which is what keeps both sides symmetric.
+#[derive(Clone)]
+struct Model {
+    freq: [u16; 64],
+    pending: [u16; 64],
+    n: usize,
+    total: u32,
+    pending_count: u32,
+    period: u8,
+}
+
+impl Model {
+    fn new(n: usize, period: u8) -> Self {
+        debug_assert!(n >= 2 && n <= 64);
+        let mut freq = [0u16; 64];
+        for f in freq[..n].iter_mut() {
+            *f = 1;
+        }
+        Self {
+            freq,
+            pending: [0u16; 64],
+            n,
+            total: n as u32,
+            pending_count: 0,
+            period,
+        }
+    }
+
+    /// Cumulative frequency below `sym`, its frequency, and the total.
+    #[inline]
+    fn cum_range(&self, sym: usize) -> (u64, u64, u64) {
+        let mut cum = 0u64;
+        for &f in &self.freq[..sym] {
+            cum += f as u64;
+        }
+        let f = self.freq[sym] as u64;
+        (cum, cum + f, self.total as u64)
+    }
+
+    /// Fold pending counts into the live table (identical on both sides).
+    #[inline]
+    fn fold(&mut self) {
+        if self.pending_count == 0 {
+            return;
+        }
+        for i in 0..self.n {
+            let add = self.pending[i];
+            if add != 0 {
+                self.freq[i] = self.freq[i].saturating_add(add);
+                self.pending[i] = 0;
+            }
+        }
+        self.total += self.pending_count;
+        self.pending_count = 0;
+
+        // Keep totals bounded so `range * total` never overflows and every symbol keeps a
+        // non-zero frequency.
+        if self.total > MODEL_MAX_TOTAL {
+            self.rescale();
+        }
+    }
+
+    /// Halve all frequencies, keeping them ≥ 1 and the total bounded.
+    #[inline]
+    fn rescale(&mut self) {
+        let mut total = 0u32;
+        for i in 0..self.n {
+            let f = ((self.freq[i] as u32 + 1) >> 1) as u16;
+            self.freq[i] = f;
+            total += f as u32;
+        }
+        self.total = total;
+    }
+
+    /// Update the model after coding `sym` (no-op for static models).
+    #[inline]
+    fn update(&mut self, sym: usize) {
+        match self.period {
+            0 => {}
+            1 => {
+                self.freq[sym] += 1;
+                self.total += 1;
+                if self.total > MODEL_MAX_TOTAL {
+                    self.rescale();
+                }
+            }
+            p => {
+                self.pending[sym] += 1;
+                self.pending_count += 1;
+                if self.pending_count >= p as u32 {
+                    self.fold();
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bit-oriented arithmetic coder (32-bit code values, deferred underflow)
+// ---------------------------------------------------------------------------
+
+const HALF: u64 = 0x8000_0000;
+const QUARTER: u64 = 0x4000_0000;
+const THREE_QUARTER: u64 = 0xC000_0000;
+const MASK32: u64 = 0xFFFF_FFFF;
+
+/// MSB-first bit sink; pads the final partial byte with zero bits.
+struct BitOut {
+    buf: Vec<u8>,
+    cur: u8,
+    nbits: u8,
+}
+
+impl BitOut {
+    fn new() -> Self {
+        Self { buf: Vec::with_capacity(4096), cur: 0, nbits: 0 }
+    }
+
+    #[inline]
+    fn put(&mut self, bit: bool) {
+        self.cur = (self.cur << 1) | bit as u8;
+        self.nbits += 1;
+        if self.nbits == 8 {
+            self.buf.push(self.cur);
+            self.cur = 0;
+            self.nbits = 0;
+        }
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        if self.nbits > 0 {
+            self.buf.push(self.cur << (8 - self.nbits));
+        }
+        self.buf
+    }
+}
+
+/// MSB-first bit source; bits past the end read as zero (arithmetic-coder padding convention).
+struct BitIn<'a> {
+    buf: &'a [u8],
+    pos: usize,
+    bit: u8,
+}
+
+impl<'a> BitIn<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        Self { buf, pos: 0, bit: 0 }
+    }
+
+    #[inline]
+    fn get(&mut self) -> u64 {
+        if self.pos >= self.buf.len() {
+            return 0;
+        }
+        let b = ((self.buf[self.pos] >> (7 - self.bit)) & 1) as u64;
+        self.bit += 1;
+        if self.bit == 8 {
+            self.bit = 0;
+            self.pos += 1;
+        }
+        b
+    }
+}
+
+struct ArithEncoder {
+    low: u64,
+    high: u64,
+    pending: u32,
+    out: BitOut,
+}
+
+impl ArithEncoder {
+    fn new() -> Self {
+        Self { low: 0, high: MASK32, pending: 0, out: BitOut::new() }
+    }
+
+    #[inline]
+    fn bit_follow(&mut self, bit: bool) {
+        self.out.put(bit);
+        let inv = !bit;
+        while self.pending > 0 {
+            self.out.put(inv);
+            self.pending -= 1;
+        }
+    }
+
+    #[inline]
+    fn renorm(&mut self) {
+        loop {
+            if self.high < HALF {
+                self.bit_follow(false);
+            } else if self.low >= HALF {
+                self.bit_follow(true);
+                self.low -= HALF;
+                self.high -= HALF;
+            } else if self.low >= QUARTER && self.high < THREE_QUARTER {
+                self.pending += 1;
+                self.low -= QUARTER;
+                self.high -= QUARTER;
+            } else {
+                break;
+            }
+            self.low = (self.low << 1) & MASK32;
+            self.high = ((self.high << 1) | 1) & MASK32;
+        }
+    }
+
+    #[inline]
+    fn encode_range(&mut self, cum_low: u64, cum_high: u64, total: u64) {
+        let range = self.high - self.low + 1;
+        self.high = self.low + range * cum_high / total - 1;
+        self.low += range * cum_low / total;
+        self.renorm();
+    }
+
+    #[inline]
+    fn encode_bit(&mut self, model: &mut Model, bit: bool) {
+        let sym = bit as usize;
+        let (cl, ch, total) = model.cum_range(sym);
+        self.encode_range(cl, ch, total);
+        model.update(sym);
+    }
+
+    #[inline]
+    fn encode_sym(&mut self, model: &mut Model, sym: usize) {
+        let (cl, ch, total) = model.cum_range(sym);
+        self.encode_range(cl, ch, total);
+        model.update(sym);
+    }
+
+    /// Uniform binary split (exactly 1/2 each): the `nbits` low magnitude bits / raw payload.
+    #[inline]
+    fn encode_raw(&mut self, value: u32, nbits: u8) {
+        let mut i = nbits;
+        while i > 0 {
+            i -= 1;
+            let bit = ((value >> i) & 1) != 0;
+            let range = self.high - self.low + 1;
+            let half = range >> 1;
+            if bit {
+                self.low += half;
+            } else {
+                self.high = self.low + half - 1;
+            }
+            self.renorm();
+        }
+    }
+
+    /// Emit the disambiguating bit plus all pending underflow bits, then pad the byte.
+    fn finish(mut self) -> Vec<u8> {
+        self.pending += 1;
+        if self.low < QUARTER {
+            self.bit_follow(false);
+        } else {
+            self.bit_follow(true);
+        }
+        self.out.finish()
+    }
+}
+
+struct ArithDecoder<'a> {
+    low: u64,
+    high: u64,
+    code: u64,
+    inp: BitIn<'a>,
+}
+
+impl<'a> ArithDecoder<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        let mut inp = BitIn::new(buf);
+        let mut code = 0u64;
+        for _ in 0..32 {
+            code = (code << 1) | inp.get();
+        }
+        Self { low: 0, high: MASK32, code, inp }
+    }
+
+    #[inline]
+    fn renorm(&mut self) {
+        loop {
+            if self.high < HALF {
+                // nothing
+            } else if self.low >= HALF {
+                self.code -= HALF;
+                self.low -= HALF;
+                self.high -= HALF;
+            } else if self.low >= QUARTER && self.high < THREE_QUARTER {
+                self.code -= QUARTER;
+                self.low -= QUARTER;
+                self.high -= QUARTER;
+            } else {
+                break;
+            }
+            self.low = (self.low << 1) & MASK32;
+            self.high = ((self.high << 1) | 1) & MASK32;
+            self.code = ((self.code << 1) & MASK32) | self.inp.get();
+        }
+    }
+
+    #[inline]
+    fn decode_sym(&mut self, model: &mut Model) -> usize {
+        let range = self.high - self.low + 1;
+        let total = model.total as u64;
+        // Classic inverse of `encode_range`: maps `code` into [0, total-1].
+        let scaled = (((self.code - self.low + 1) * total) - 1) / range;
+
+        let mut cum = 0u64;
+        let mut sym = model.n - 1;
+        for i in 0..model.n {
+            let f = model.freq[i] as u64;
+            if scaled < cum + f {
+                sym = i;
+                break;
+            }
+            cum += f;
+        }
+        let f = model.freq[sym] as u64;
+        self.high = self.low + range * (cum + f) / total - 1;
+        self.low += range * cum / total;
+        self.renorm();
+        model.update(sym);
+        sym
+    }
+
+    #[inline]
+    fn decode_bit(&mut self, model: &mut Model) -> bool {
+        self.decode_sym(model) != 0
+    }
+
+    #[inline]
+    fn decode_raw(&mut self, nbits: u8) -> u32 {
+        let mut value = 0u32;
+        let mut i = nbits;
+        while i > 0 {
+            i -= 1;
+            let range = self.high - self.low + 1;
+            let half = range >> 1;
+            let bit = self.code - self.low >= half;
+            if bit {
+                self.low += half;
+                value |= 1 << i;
+            } else {
+                self.high = self.low + half - 1;
+            }
+            self.renorm();
+        }
+        value
+    }
+}
+
+/// Encoder/decoder abstraction used by the shared block walker.
+///
+/// The encoder consumes the supplied `sym`/`bit`/`value`; the decoder ignores them and returns
+/// what it decoded. `process_block` therefore has exactly one code path for both directions.
+trait Coder {
+    const ENCODE: bool;
+    fn code_sym(&mut self, model: &mut Model, sym: usize) -> usize;
+    fn code_bit(&mut self, model: &mut Model, bit: bool) -> bool;
+    fn code_raw(&mut self, value: u32, nbits: u8) -> u32;
+}
+
+impl Coder for ArithEncoder {
+    const ENCODE: bool = true;
+
+    #[inline]
+    fn code_sym(&mut self, model: &mut Model, sym: usize) -> usize {
+        self.encode_sym(model, sym);
+        sym
+    }
+
+    #[inline]
+    fn code_bit(&mut self, model: &mut Model, bit: bool) -> bool {
+        self.encode_bit(model, bit);
+        bit
+    }
+
+    #[inline]
+    fn code_raw(&mut self, value: u32, nbits: u8) -> u32 {
+        self.encode_raw(value, nbits);
+        value
+    }
+}
+
+impl<'a> Coder for ArithDecoder<'a> {
+    const ENCODE: bool = false;
+
+    #[inline]
+    fn code_sym(&mut self, model: &mut Model, _sym: usize) -> usize {
+        self.decode_sym(model)
+    }
+
+    #[inline]
+    fn code_bit(&mut self, model: &mut Model, _bit: bool) -> bool {
+        self.decode_bit(model)
+    }
+
+    #[inline]
+    fn code_raw(&mut self, _value: u32, nbits: u8) -> u32 {
+        self.decode_raw(nbits)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Context models and the shared block walker
+// ---------------------------------------------------------------------------
+
+const NZ_CONTEXTS: usize = 32; // 8 zigzag bands × 4 zero-run buckets
+const CAT_CONTEXTS: usize = 32; // 8 zigzag bands × 4 previous-category buckets
+const LAST_NZ_CONTEXTS: usize = 4; // bucketed previous-block last_nz
+const DC_CAT_CONTEXTS: usize = 4; // bucketed previous DC category
+
+struct PlaneModels {
+    last_nz: [Model; LAST_NZ_CONTEXTS],
+    nz: [Model; NZ_CONTEXTS],
+    cat: [Model; CAT_CONTEXTS],
+    sign: Model,
+    dc_cat: [Model; DC_CAT_CONTEXTS],
+    dc_sign: Model,
+}
+
+impl PlaneModels {
+    fn new(period: u8) -> Self {
+        Self {
+            last_nz: core::array::from_fn(|_| Model::new(64, period)),
+            nz: core::array::from_fn(|_| Model::new(2, period)),
+            cat: core::array::from_fn(|_| Model::new(16, period)),
+            sign: Model::new(2, period),
+            dc_cat: core::array::from_fn(|_| Model::new(17, period)),
+            dc_sign: Model::new(2, period),
+        }
+    }
+}
+
+/// Per-plane adaptive context carried from block to block.
+struct PlaneCtx {
+    prev_dc: i16,
+    prev_dc_cat: usize,
+    prev_last_bucket: usize,
+}
+
+impl PlaneCtx {
+    fn new() -> Self {
+        Self { prev_dc: 0, prev_dc_cat: 0, prev_last_bucket: 0 }
+    }
+}
+
+#[inline]
+fn floor_log2(m: u32) -> u8 {
+    debug_assert!(m >= 1);
+    31 - m.leading_zeros() as u8
+}
+
+#[inline]
+fn bucket_last_nz(last: usize) -> usize {
+    match last {
+        0 => 0,
+        1..=3 => 1,
+        4..=15 => 2,
+        _ => 3,
+    }
+}
+
+/// Walk one 8×8 block through the shared coder.
+///
+/// With `C::ENCODE == true` the coefficient values are read from `block`; otherwise the decoded
+/// values are written into it. Every coding decision (models, contexts, update order) is shared.
+fn process_block<C: Coder>(
+    coder: &mut C,
+    models: &mut PlaneModels,
+    block: &mut Block,
+    ctx: &mut PlaneCtx,
+    use_dc_delta: bool,
+) {
+    // --- DC -------------------------------------------------------------
+    let dc_known: i32 = if C::ENCODE { block.data[ZIGZAG[0]] as i32 } else { 0 };
+    let dc_emit_known: i32 = if C::ENCODE {
+        if use_dc_delta {
+            block.data[ZIGZAG[0]].wrapping_sub(ctx.prev_dc) as i32
+        } else {
+            dc_known
+        }
+    } else {
+        0
+    };
+    let dc_abs = dc_emit_known.unsigned_abs();
+    let dc_cat_known = if dc_abs == 0 { 0 } else { (floor_log2(dc_abs) + 1) as usize };
+    let dc_cat = coder.code_sym(&mut models.dc_cat[ctx.prev_dc_cat], dc_cat_known);
+
+    // Magnitude is split as: implicit leading 1 (for cat > 0) + (cat-1) raw low bits.
+    // The encoder derives the raw bits from its own category; the decoder uses the decoded one.
+    let (dc_raw_known, dc_neg_known) = if C::ENCODE && dc_cat_known > 0 {
+        let low = dc_abs - (1u32 << (dc_cat_known - 1));
+        (low, dc_emit_known < 0)
+    } else {
+        (0, false)
+    };
+    let dc_raw = if dc_cat > 0 {
+        debug_assert!(!C::ENCODE || dc_cat == dc_cat_known);
+        coder.code_raw(dc_raw_known, (dc_cat - 1) as u8)
+    } else {
+        0
+    };
+    let dc_neg = if dc_cat > 0 {
+        coder.code_bit(&mut models.dc_sign, dc_neg_known)
+    } else {
+        false
+    };
+
+    let dc_mag = if dc_cat == 0 { 0 } else { (1u32 << (dc_cat - 1)) | dc_raw };
+    let dc_emit = if dc_neg { -(dc_mag as i32) } else { dc_mag as i32 };
+    let dc_val: i16 = if use_dc_delta {
+        ctx.prev_dc.wrapping_add(dc_emit as i16)
+    } else {
+        dc_emit as i16
+    };
+    if !C::ENCODE {
+        block.data[ZIGZAG[0]] = dc_val;
+    }
+    ctx.prev_dc = dc_val;
+    ctx.prev_dc_cat = dc_cat.min(3);
+
+    // --- AC -------------------------------------------------------------
+    let last_known: usize = if C::ENCODE {
+        let mut last = 0usize;
+        for zi in (1..64).rev() {
+            if block.data[ZIGZAG[zi]] != 0 {
+                last = zi;
+                break;
+            }
+        }
+        last
+    } else {
+        0
+    };
+    let last = coder.code_sym(&mut models.last_nz[ctx.prev_last_bucket], last_known);
+
+    let mut run = 0usize;
+    let mut prev_cat = 0usize;
+    for zi in 1..=last {
+        let band = (zi - 1) >> 3;
+        let nz = if zi == last {
+            true
+        } else {
+            let known = if C::ENCODE { block.data[ZIGZAG[zi]] != 0 } else { false };
+            coder.code_bit(&mut models.nz[band * 4 + run.min(3)], known)
+        };
+        if !nz {
+            run += 1;
+            continue;
+        }
+
+        let v_known: i32 = if C::ENCODE { block.data[ZIGZAG[zi]] as i32 } else { 0 };
+        let abs_known = v_known.unsigned_abs();
+        let cat_known = if C::ENCODE { floor_log2(abs_known) as usize } else { 0 };
+        let cat = coder.code_sym(&mut models.cat[band * 4 + prev_cat.min(3)], cat_known);
+
+        let (raw_known, neg_known) = if C::ENCODE {
+            (abs_known - (1u32 << cat_known), v_known < 0)
+        } else {
+            (0, false)
+        };
+        debug_assert!(!C::ENCODE || cat == cat_known);
+        let raw = coder.code_raw(raw_known, cat as u8);
+        let neg = coder.code_bit(&mut models.sign, neg_known);
+
+        let mag = (1u32 << cat) | raw;
+        let v = if neg { -(mag as i32) } else { mag as i32 };
+        if !C::ENCODE {
+            block.data[ZIGZAG[zi]] = v as i16;
+        }
+        prev_cat = cat;
+        run = 0;
+    }
+    ctx.prev_last_bucket = bucket_last_nz(last);
+}
+
+fn arith_encode_plane(
+    blocks: &[Block],
+    use_dc_delta: bool,
+    period: u8,
+) -> Vec<u8> {
+    let mut enc = ArithEncoder::new();
+    let mut models = PlaneModels::new(period);
+    let mut ctx = PlaneCtx::new();
+    for block in blocks {
+        let mut copy = *block;
+        process_block(&mut enc, &mut models, &mut copy, &mut ctx, use_dc_delta);
+    }
+    let payload = enc.finish();
+
+    let mut data = Vec::with_capacity(ARITH_HEADER_SIZE + payload.len());
+    data.extend_from_slice(&ARITH_MAGIC);
+    data.push(ARITH_CODEC_VERSION);
+    data.push(period & 0x7F);
+    data.extend_from_slice(&payload);
+
+    let mut out = Vec::with_capacity(4 + data.len());
+    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    out.extend_from_slice(&data);
+    out
+}
+
+fn arith_decode_plane(
+    payload: &[u8],
+    n_blocks: usize,
+    use_dc_delta: bool,
+    period: u8,
+) -> Option<Vec<Block>> {
+    let body = payload.get(ARITH_HEADER_SIZE..)?;
+    let mut dec = ArithDecoder::new(body);
+    let mut models = PlaneModels::new(period);
+    let mut ctx = PlaneCtx::new();
+    let mut blocks = Vec::with_capacity(n_blocks);
+    for _ in 0..n_blocks {
+        let mut block = Block::new();
+        process_block(&mut dec, &mut models, &mut block, &mut ctx, use_dc_delta);
+        blocks.push(block);
+    }
+    Some(blocks)
+}
+
+// ---------------------------------------------------------------------------
 // Encode / decode a full plane of blocks
 // ---------------------------------------------------------------------------
 
 /// Encode all blocks of a plane into a Vec<u8> prefixed with its byte length (u32 LE).
-/// Format: [len: u32 LE][bitstream bytes]
-/// The length prefix allows the decoder to skip exactly to the next plane boundary.
+/// Format: [len: u32 LE][payload]
+/// The payload is arithmetic-coded (see module docs); the length prefix lets the decoder skip
+/// exactly to the next plane boundary.
 pub fn encode_plane(blocks: &[Block], is_chroma: bool) -> Vec<u8> {
     encode_plane_with_profile(blocks, is_chroma, false, false)
 }
@@ -505,6 +1241,30 @@ pub fn encode_plane_with_ac(blocks: &[Block], is_chroma: bool, use_chroma_ac: bo
 }
 
 pub fn encode_plane_with_profile(
+    blocks: &[Block],
+    is_chroma: bool,
+    use_chroma_ac: bool,
+    use_dc_delta: bool,
+) -> Vec<u8> {
+    encode_plane_with_period(blocks, is_chroma, use_chroma_ac, use_dc_delta, arithmetic_update_period())
+}
+
+/// Same as [`encode_plane_with_profile`] with an explicit model update period.
+/// `0` = static models, `1` = update after every symbol, `N` = fold every N symbols.
+pub(crate) fn encode_plane_with_period(
+    blocks: &[Block],
+    _is_chroma: bool,
+    _use_chroma_ac: bool,
+    use_dc_delta: bool,
+    period: u8,
+) -> Vec<u8> {
+    arith_encode_plane(blocks, use_dc_delta, period.min(MAX_UPDATE_PERIOD))
+}
+
+/// Legacy Huffman plane encoder (pre-2.1 streams). Kept for reference/tests only; the public
+/// encoder above now emits arithmetic-coded payloads.
+#[cfg(test)]
+pub(crate) fn legacy_encode_plane_with_profile(
     blocks: &[Block],
     is_chroma: bool,
     use_chroma_ac: bool,
@@ -608,14 +1368,25 @@ pub fn decode_plane_with_profile(
     if start + 4 > buf.len() { return None; }
     let plane_len = u32::from_le_bytes(buf[start..start+4].try_into().unwrap()) as usize;
     let data_start = start + 4;
-    let data_end   = data_start + plane_len;
+    let data_end   = data_start.checked_add(plane_len)?;
     if data_end > buf.len() {
         return None;
     }
+    let data = &buf[data_start..data_end];
 
+    // Arithmetic payload: [magic][version][config][range-coded body].
+    if data.len() >= 4 && data[..4] == ARITH_MAGIC {
+        if data.len() < ARITH_HEADER_SIZE || data[4] != ARITH_CODEC_VERSION {
+            return None;
+        }
+        let period = data[5] & 0x7F;
+        let blocks = arith_decode_plane(data, n_blocks, use_dc_delta, period)?;
+        return Some((blocks, data_end));
+    }
+
+    // Legacy Huffman payload (written by bitgrain <= 2.0.0).
     let dc_tree = if is_chroma { chroma_dc_tree() } else { luma_dc_tree() };
     let ac_tree = ac_tree(use_chroma_ac);
-    let data = &buf[data_start..data_end];
 
     let mut reader = BitReader::new(data, 0);
     let blocks = decode_plane_blocks(&mut reader, n_blocks, dc_tree, ac_tree, use_dc_delta)?;
