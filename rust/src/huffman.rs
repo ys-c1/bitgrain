@@ -337,6 +337,30 @@ impl<'a> BitReader<'a> {
         Self { buf, pos: start, bit_buf: 0, bits_in: 0 }
     }
 
+    /// Resume reading at an arbitrary entropy-bit position recorded by the encoder:
+    /// `byte_pos` is the byte containing the next unread bit and `bit_off` is the
+    /// number of bits already consumed from it (MSB-first, 0..=7).
+    ///
+    /// The first byte is loaded manually, so JPEG byte-unstuffing is mirrored here:
+    /// if it is 0xFF, the stuffed 0x00 that follows it is skipped.
+    pub fn new_at_bit(buf: &'a [u8], byte_pos: usize, bit_off: u8) -> Option<Self> {
+        if bit_off > 7 || byte_pos >= buf.len() {
+            return None;
+        }
+        let byte = buf[byte_pos];
+        let mut pos = byte_pos + 1;
+        if byte == 0xFF && pos < buf.len() && buf[pos] == 0x00 {
+            pos += 1;
+        }
+        let keep = 8 - bit_off;
+        Some(Self {
+            buf,
+            pos,
+            bit_buf: (byte as u64) & ((1u64 << keep) - 1),
+            bits_in: keep,
+        })
+    }
+
     #[inline]
     fn refill(&mut self) {
         while self.bits_in <= 56 && self.pos < self.buf.len() {
@@ -510,14 +534,38 @@ pub fn encode_plane_with_profile(
     use_chroma_ac: bool,
     use_dc_delta: bool,
 ) -> Vec<u8> {
+    encode_plane_with_profile_indexed(blocks, is_chroma, use_chroma_ac, use_dc_delta).0
+}
+
+/// Encode all blocks of a plane (same bitstream as [`encode_plane_with_profile`])
+/// and, while encoding, record a random-access restart point for **every** block:
+/// the byte offset of the block's first entropy bit (relative to the start of the
+/// returned plane buffer, i.e. including the 4-byte length prefix), the bit offset
+/// of that bit inside the byte (MSB-first), and the DC predictor state with which
+/// the decoder must start so the block decodes independently of its predecessors.
+pub fn encode_plane_with_profile_indexed(
+    blocks: &[Block],
+    is_chroma: bool,
+    use_chroma_ac: bool,
+    use_dc_delta: bool,
+) -> (Vec<u8>, Vec<BlockRestart>) {
     let dc_table = if is_chroma { CHROMA_DC_TABLE } else { LUMA_DC_TABLE };
     let ac_table = if use_chroma_ac { jpeg_chroma_ac_table() } else { jpeg_ac_table() };
     let eob = ac_table[0x00];
     let zrl = ac_table[0xF0];
     let mut w = BitWriter::new();
     let mut prev_dc: i16 = 0;
+    let mut restarts = Vec::with_capacity(blocks.len());
 
     for block in blocks {
+        // Restart point for this block: its first bit lands in the next byte to be
+        // emitted (w.buf.len()), after `w.bits_in` pending bits of the previous block.
+        restarts.push(BlockRestart {
+            byte_off: (4 + w.buf.len()) as u32,
+            dc_pred: prev_dc,
+            bit_off: w.bits_in,
+        });
+
         // DC
         let dc_val = block.data[ZIGZAG[0]];
         let dc_emit = if use_dc_delta {
@@ -577,7 +625,7 @@ pub fn encode_plane_with_profile(
     let mut out = Vec::with_capacity(4 + data.len());
     out.extend_from_slice(&len.to_le_bytes());
     out.extend_from_slice(&data);
-    out
+    (out, restarts)
 }
 
 /// Decode a plane of `n_blocks` blocks from `buf[start..]`.
@@ -618,10 +666,30 @@ pub fn decode_plane_with_profile(
     let data = &buf[data_start..data_end];
 
     let mut reader = BitReader::new(data, 0);
-    let blocks = decode_plane_blocks(&mut reader, n_blocks, dc_tree, ac_tree, use_dc_delta)?;
+    let blocks = decode_plane_blocks(&mut reader, n_blocks, dc_tree, ac_tree, use_dc_delta, 0)?;
 
     // Return data_end as the next byte position (exact plane boundary)
     Some((blocks, data_end))
+}
+
+/// Decode `n_blocks` consecutive blocks starting from a recorded restart point.
+///
+/// `stream` is the whole .bg file and `restart` carries absolute file offsets
+/// (as stored in a parsed [`BgIndex`]). The blocks decode independently of every
+/// preceding block: the bit reader resumes at the recorded entropy-bit position
+/// and the DC predictor is seeded from `restart.dc_pred`.
+pub fn decode_blocks_at(
+    stream: &[u8],
+    restart: &BlockRestart,
+    n_blocks: usize,
+    is_chroma: bool,
+    use_chroma_ac: bool,
+    use_dc_delta: bool,
+) -> Option<Vec<Block>> {
+    let mut reader = BitReader::new_at_bit(stream, restart.byte_off as usize, restart.bit_off)?;
+    let dc_tree = if is_chroma { chroma_dc_tree() } else { luma_dc_tree() };
+    let ac_tree = ac_tree(use_chroma_ac);
+    decode_plane_blocks(&mut reader, n_blocks, dc_tree, ac_tree, use_dc_delta, restart.dc_pred)
 }
 
 fn decode_plane_blocks(
@@ -630,9 +698,10 @@ fn decode_plane_blocks(
     dc_tree: &DecodeTree,
     ac_tree: &DecodeTree,
     use_dc_delta: bool,
+    init_prev_dc: i16,
 ) -> Option<Vec<Block>> {
     let mut blocks = Vec::with_capacity(n_blocks);
-    let mut prev_dc: i16 = 0;
+    let mut prev_dc: i16 = init_prev_dc;
     for _bi in 0..n_blocks {
         let mut block = Block::new();
 
@@ -693,3 +762,749 @@ fn decode_plane_blocks(
     Some(blocks)
 }
 
+
+// ---------------------------------------------------------------------------
+// Random-access block index (.bg sidecar)
+// ---------------------------------------------------------------------------
+//
+// Motivation: the Huffman bitstream of a plane is continuous across blocks and
+// (v10+) DC coefficients are delta-coded, so decoding block N previously
+// required decoding blocks 0..N first. The encoder now records, for every
+// block, the exact entropy-bit position and the DC predictor state needed to
+// resume decoding there. A serialized `BgIndex` keeps one restart point per
+// `stride` blocks (a "chunk"); a chunk decodes fully independently, which
+// enables frame/region-level random preview without a from-the-start decode.
+//
+// Serialized layout (all integers little-endian):
+//   "BGIX"            4 bytes  magic
+//   version           1 byte   (= 1)
+//   n_planes          1 byte
+//   stride            u32      blocks per chunk (same for all planes)
+//   per plane:
+//     n_blocks        u32
+//     n_entries       u32      (= ceil(n_blocks / stride))
+//   entries           n_entries x 7 bytes, plane 0 first, in block order:
+//     byte_off        u32      absolute offset in the .bg file of the byte
+//                              holding the chunk's first entropy bit
+//     dc_pred         i16      DC predictor state at chunk start
+//     bit_off         u8       consumed bits (MSB-first) in that byte, 0..=7
+//   crc32             u32      CRC-32 (IEEE) of every preceding byte
+//
+// Any corruption (bad magic/version, truncated or inconsistent structure,
+// CRC mismatch) makes `BgIndex::parse` return `None`.
+
+/// Restart point allowing independent decode of one block (and its successors).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockRestart {
+    /// Byte offset of the block's first entropy bit. Relative to the plane
+    /// buffer start (length prefix included) when produced by
+    /// [`encode_plane_with_profile_indexed`]; absolute file offset once stored
+    /// in a [`BgIndex`].
+    pub byte_off: u32,
+    /// DC predictor (previous block's quantized DC, 0 at plane start).
+    pub dc_pred: i16,
+    /// Bits already consumed from that byte, MSB-first (0..=7).
+    pub bit_off: u8,
+}
+
+/// Random-access index for one plane: one restart point per `stride` blocks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlaneIndex {
+    pub n_blocks: u32,
+    /// Restart points for blocks 0, stride, 2*stride, ... (absolute offsets).
+    pub entries: Vec<BlockRestart>,
+}
+
+/// Whole-stream random-access index.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BgIndex {
+    /// Blocks per chunk; chunk c of a plane covers blocks [c*stride, ...).
+    pub stride: u32,
+    pub planes: Vec<PlaneIndex>,
+}
+
+const BG_INDEX_MAGIC: &[u8; 4] = b"BGIX";
+const BG_INDEX_VERSION: u8 = 1;
+
+/// CRC-32 (IEEE 802.3, polynomial 0xEDB88320), computed over `data`.
+/// Bitwise implementation: index blobs are small, so a table is not worth it.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+        }
+    }
+    !crc
+}
+
+impl BgIndex {
+    /// Build an index from per-plane restart points recorded at encode time.
+    ///
+    /// `planes` yields, per plane, `(plane_file_pos, restarts)` where
+    /// `plane_file_pos` is the plane's byte offset in the .bg file and
+    /// `restarts` are the plane-relative per-block restart points returned by
+    /// [`encode_plane_with_profile_indexed`]. The smallest `stride` whose
+    /// serialized index stays within `max_index_bytes` is chosen, so the index
+    /// adapts to the stream's entropy (high-entropy streams get finer chunks).
+    pub fn build(planes: &[(usize, Vec<BlockRestart>)], max_index_bytes: usize) -> BgIndex {
+        let n_planes = planes.len();
+        let total_blocks: usize = planes.iter().map(|(_, r)| r.len()).sum();
+        let mut stride = 1usize;
+        while stride <= total_blocks {
+            let entries: usize = planes
+                .iter()
+                .map(|(_, r)| r.len().div_ceil(stride))
+                .sum();
+            let size = 4 + 1 + 1 + 4 + 8 * n_planes + 7 * entries + 4;
+            if size <= max_index_bytes || stride >= total_blocks.max(1) {
+                break;
+            }
+            stride += 1;
+        }
+
+        let planes = planes
+            .iter()
+            .map(|(plane_pos, restarts)| {
+                let entries = restarts
+                    .iter()
+                    .step_by(stride)
+                    .map(|r| BlockRestart {
+                        byte_off: r.byte_off + *plane_pos as u32,
+                        dc_pred: r.dc_pred,
+                        bit_off: r.bit_off,
+                    })
+                    .collect();
+                PlaneIndex {
+                    n_blocks: restarts.len() as u32,
+                    entries,
+                }
+            })
+            .collect();
+        BgIndex {
+            stride: stride as u32,
+            planes,
+        }
+    }
+
+    /// Locate the chunk containing block `block_idx` of plane `plane`.
+    /// Returns `(restart, first_block, n_blocks_in_chunk)`.
+    pub fn locate(&self, plane: usize, block_idx: usize) -> Option<(BlockRestart, usize, usize)> {
+        let p = self.planes.get(plane)?;
+        let stride = self.stride as usize;
+        if stride == 0 || block_idx >= p.n_blocks as usize {
+            return None;
+        }
+        let chunk = block_idx / stride;
+        let restart = *p.entries.get(chunk)?;
+        let first = chunk * stride;
+        let len = stride.min(p.n_blocks as usize - first);
+        Some((restart, first, len))
+    }
+
+    /// Serialized size in bytes (== `self.serialize().len()` without allocating).
+    pub fn serialized_size(&self) -> usize {
+        let entries: usize = self.planes.iter().map(|p| p.entries.len()).sum();
+        4 + 1 + 1 + 4 + 8 * self.planes.len() + 7 * entries + 4
+    }
+
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.serialized_size());
+        out.extend_from_slice(BG_INDEX_MAGIC);
+        out.push(BG_INDEX_VERSION);
+        out.push(self.planes.len() as u8);
+        out.extend_from_slice(&self.stride.to_le_bytes());
+        for p in &self.planes {
+            out.extend_from_slice(&p.n_blocks.to_le_bytes());
+            out.extend_from_slice(&(p.entries.len() as u32).to_le_bytes());
+        }
+        for p in &self.planes {
+            for e in &p.entries {
+                out.extend_from_slice(&e.byte_off.to_le_bytes());
+                out.extend_from_slice(&e.dc_pred.to_le_bytes());
+                out.push(e.bit_off);
+            }
+        }
+        let crc = crc32(&out);
+        out.extend_from_slice(&crc.to_le_bytes());
+        out
+    }
+
+    /// Parse and validate an index blob. Returns `None` on any corruption:
+    /// bad magic/version, truncation, structural inconsistency, out-of-range
+    /// or non-monotonic offsets, or CRC mismatch.
+    pub fn parse(data: &[u8]) -> Option<BgIndex> {
+        if data.len() < 4 + 1 + 1 + 4 + 4 {
+            return None;
+        }
+        if &data[0..4] != BG_INDEX_MAGIC || data[4] != BG_INDEX_VERSION {
+            return None;
+        }
+        let n_planes = data[5] as usize;
+        if n_planes == 0 || n_planes > 8 {
+            return None;
+        }
+        let stride = u32::from_le_bytes(data[6..10].try_into().unwrap());
+        if stride == 0 {
+            return None;
+        }
+        let mut pos = 10usize;
+        let mut plane_meta = Vec::with_capacity(n_planes);
+        for _ in 0..n_planes {
+            if pos + 8 > data.len() {
+                return None;
+            }
+            let n_blocks = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+            let n_entries = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap());
+            pos += 8;
+            if n_blocks == 0 {
+                return None;
+            }
+            // Entry count must exactly match the stride-derived chunk count.
+            if n_entries as u64 != (n_blocks as u64).div_ceil(stride as u64) {
+                return None;
+            }
+            plane_meta.push((n_blocks, n_entries as usize));
+        }
+        let mut planes = Vec::with_capacity(n_planes);
+        for &(n_blocks, n_entries) in &plane_meta {
+            if pos + 7 * n_entries + 4 > data.len() {
+                return None;
+            }
+            let mut entries = Vec::with_capacity(n_entries);
+            let mut prev_off = 0u32;
+            for i in 0..n_entries {
+                let byte_off = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+                let dc_pred = i16::from_le_bytes(data[pos + 4..pos + 6].try_into().unwrap());
+                let bit_off = data[pos + 6];
+                pos += 7;
+                if bit_off > 7 {
+                    return None;
+                }
+                // Offsets must be strictly increasing within a plane.
+                if i > 0 && byte_off <= prev_off {
+                    return None;
+                }
+                prev_off = byte_off;
+                entries.push(BlockRestart {
+                    byte_off,
+                    dc_pred,
+                    bit_off,
+                });
+            }
+            planes.push(PlaneIndex { n_blocks, entries });
+        }
+        if pos + 4 != data.len() {
+            return None;
+        }
+        let want = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+        if crc32(&data[..pos]) != want {
+            return None;
+        }
+        Some(BgIndex { stride, planes })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Random-access index acceptance tests
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod random_access_tests {
+    use super::*;
+    use crate::block::Block;
+    use crate::blockizer::Blockizer;
+    use crate::colorspace;
+    use crate::dct;
+    use crate::encoder;
+    use std::time::Instant;
+
+    // The C SIMD quantize/dequantize (c/quant.c) is not linkable from
+    // `cargo test`, so the tests use these local equivalents. Dequantize is
+    // bit-exact with the C scalar path; quantize mirrors its float-division
+    // semantics. Both the seek and the from-the-start decode paths below use
+    // the same functions, so pixel-exactness is checked on equal footing.
+    fn quantize_local(block: &mut Block, table: &[i16; 64]) {
+        for i in 0..64 {
+            block.data[i] = ((block.data[i] as f32) / (table[i] as f32)).round() as i16;
+        }
+    }
+
+    fn dequantize_local(block: &mut Block, table: &[i16; 64]) {
+        for i in 0..64 {
+            let v = block.data[i] as i32 * table[i] as i32;
+            block.data[i] = v.clamp(-32768, 32767) as i16;
+        }
+    }
+
+    const W: usize = 256;
+    const H: usize = 256;
+    const QUALITY: u8 = 50;
+
+    // -- deterministic sample material generators (no external assets) -------
+
+    fn xorshift(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    /// Material 1: smooth gradients with a mild sinusoidal texture.
+    fn gen_gradient() -> Vec<u8> {
+        let mut img = vec![0u8; W * H * 3];
+        for y in 0..H {
+            for x in 0..W {
+                let fx = x as f32;
+                let fy = y as f32;
+                let i = (y * W + x) * 3;
+                let r = (x * 255 / (W - 1)) as f32 + 28.0 * (fx * 0.31).sin() * (fy * 0.23).cos();
+                let g = (y * 255 / (H - 1)) as f32 + 22.0 * ((fx + fy) * 0.19).sin();
+                let b = ((x + y) * 255 / (W + H - 2)) as f32
+                    + 26.0 * (fy * 0.37).sin() * (fx * 0.29).cos();
+                img[i] = r.clamp(0.0, 255.0) as u8;
+                img[i + 1] = g.clamp(0.0, 255.0) as u8;
+                img[i + 2] = b.clamp(0.0, 255.0) as u8;
+            }
+        }
+        img
+    }
+
+    /// Material 2: uniform random noise (worst-case entropy).
+    fn gen_noise() -> Vec<u8> {
+        let mut img = vec![0u8; W * H * 3];
+        let mut st = 0x1234_5678_9abc_def0u64;
+        for p in img.iter_mut() {
+            *p = (xorshift(&mut st) >> 32) as u8;
+        }
+        img
+    }
+
+    /// Material 3: hard edges — checkerboard, stripes, solid rectangles.
+    fn gen_edges() -> Vec<u8> {
+        let mut img = vec![0u8; W * H * 3];
+        for y in 0..H {
+            for x in 0..W {
+                let i = (y * W + x) * 3;
+                let checker = ((x / 8) + (y / 8)) % 2 == 0;
+                let (mut r, mut g, mut b) = if checker {
+                    (255u8, 255u8, 255u8)
+                } else {
+                    (0u8, 0u8, 0u8)
+                };
+                if (x / 4) % 2 == 0 && y >= H / 2 {
+                    r = 200;
+                }
+                if x >= W / 3 && x < W / 3 + 24 && y >= H / 3 && y < H / 3 + 24 {
+                    g = 220;
+                    b = 30;
+                }
+                img[i] = r;
+                img[i + 1] = g;
+                img[i + 2] = b;
+            }
+        }
+        img
+    }
+
+    /// Material 4: photo-like RGBA — gradients + sinusoidal texture + shapes.
+    fn gen_photo_rgba() -> Vec<u8> {
+        let mut img = vec![0u8; W * H * 4];
+        for y in 0..H {
+            for x in 0..W {
+                let i = (y * W + x) * 4;
+                let fx = x as f32;
+                let fy = y as f32;
+                let tex = (fx * 0.35).sin() * (fy * 0.22).cos() * 40.0;
+                let cx = x as i32 - (W / 2) as i32;
+                let cy = y as i32 - (H / 2) as i32;
+                let in_disc = cx * cx + cy * cy < 30 * 30;
+                let r = (x * 255 / (W - 1)) as f32 + tex;
+                let g = (y * 255 / (H - 1)) as f32 + tex * 0.5;
+                let b = (128.0 + 60.0 * ((fx + fy) * 0.05).sin()) as f32;
+                img[i] = if in_disc { 240 } else { r.clamp(0.0, 255.0) as u8 };
+                img[i + 1] = if in_disc { 90 } else { g.clamp(0.0, 255.0) as u8 };
+                img[i + 2] = if in_disc { 60 } else { b.clamp(0.0, 255.0) as u8 };
+                img[i + 3] = (255 - (x * 200 / (W - 1)) as i32).clamp(30, 255) as u8;
+            }
+        }
+        img
+    }
+
+    // -- encode helpers -------------------------------------------------------
+
+    struct PlaneMeta {
+        pw: usize,
+        ph: usize,
+        is_chroma: bool,
+        file_pos: usize,
+    }
+
+    struct EncodedMaterial {
+        name: &'static str,
+        channels: usize,
+        stream: Vec<u8>,
+        index: BgIndex,
+        metas: Vec<PlaneMeta>,
+    }
+
+    /// Encode with the same pipeline the production encoder uses (colorspace,
+    /// blockizer, DCT, quantize, clamp, Huffman) but through the indexed plane
+    /// encoder so every block's restart point is recorded at encode time.
+    fn encode_indexed(name: &'static str, pixels: &[u8], channels: usize) -> EncodedMaterial {
+        let (w, h) = (W, H);
+        let cw = (w + 1) / 2;
+        let ch = (h + 1) / 2;
+        let luma_q = encoder::quant_table_for_quality_perceptual_v4(QUALITY);
+        let chroma_q = encoder::chroma_quant_table_for_quality_perceptual_v4(QUALITY);
+
+        let mut plane_src: Vec<(Vec<u8>, usize, usize, bool)> = Vec::new();
+        let version: u8;
+        if channels == 3 {
+            let (y, cb, cr) = colorspace::rgb_to_ycbcr420(pixels, w, h);
+            plane_src.push((y, w, h, false));
+            plane_src.push((cb, cw, ch, true));
+            plane_src.push((cr, cw, ch, true));
+            version = 18;
+        } else {
+            let (y, cb, cr, a) = colorspace::rgba_to_ycbcr420a(pixels, w, h);
+            plane_src.push((y, w, h, false));
+            plane_src.push((cb, cw, ch, true));
+            plane_src.push((cr, cw, ch, true));
+            plane_src.push((a, w, h, false));
+            version = 19;
+        }
+
+        let mut stream = Vec::new();
+        stream.extend_from_slice(b"BG");
+        stream.push(version);
+        stream.extend_from_slice(&(w as u32).to_le_bytes());
+        stream.extend_from_slice(&(h as u32).to_le_bytes());
+        stream.push(QUALITY);
+
+        let mut per_plane: Vec<(usize, Vec<BlockRestart>)> = Vec::new();
+        let mut metas = Vec::new();
+        for (pix, pw, ph, is_chroma) in &plane_src {
+            let table = if *is_chroma { &chroma_q } else { &luma_q };
+            let mut blocks = Blockizer::new(*pw, *ph).generate_blocks(pix);
+            for b in blocks.iter_mut() {
+                dct::dct(b);
+                quantize_local(b, table);
+                clamp_block_jpeg_coeffs(b);
+            }
+            let (plane_buf, restarts) =
+                encode_plane_with_profile_indexed(&blocks, *is_chroma, *is_chroma, true);
+            let file_pos = stream.len();
+            stream.extend_from_slice(&plane_buf);
+            per_plane.push((file_pos, restarts));
+            metas.push(PlaneMeta {
+                pw: *pw,
+                ph: *ph,
+                is_chroma: *is_chroma,
+                file_pos,
+            });
+        }
+
+        // Budget: index must stay <= 2% of the bitstream.
+        let index = BgIndex::build(&per_plane, stream.len() / 50);
+        EncodedMaterial {
+            name,
+            channels,
+            stream,
+            index,
+            metas,
+        }
+    }
+
+    fn write_block_to_plane(block: &Block, plane: &mut [u8], w: usize, h: usize, idx: usize) {
+        let bw = (w + 7) / 8;
+        let by = (idx / bw) * 8;
+        let bx = (idx % bw) * 8;
+        for y in 0..8 {
+            for x in 0..8 {
+                let py = by + y;
+                let px = bx + x;
+                if py < h && px < w {
+                    plane[py * w + px] = (block.data[y * 8 + x] + 128).clamp(0, 255) as u8;
+                }
+            }
+        }
+    }
+
+    /// Decode every chunk of every plane through the index and reassemble pixels.
+    fn seek_decode_all(m: &EncodedMaterial) -> Vec<u8> {
+        let luma_q = encoder::quant_table_for_quality_perceptual_v4(QUALITY);
+        let chroma_q = encoder::chroma_quant_table_for_quality_perceptual_v4(QUALITY);
+        let mut planes: Vec<Vec<u8>> = m
+            .metas
+            .iter()
+            .map(|mt| vec![0u8; mt.pw * mt.ph])
+            .collect();
+        for (pi, mt) in m.metas.iter().enumerate() {
+            let table = if mt.is_chroma { &chroma_q } else { &luma_q };
+            let n_chunks = m.index.planes[pi].entries.len();
+            for ci in 0..n_chunks {
+                let (restart, first, len) = m.index.locate(pi, ci * m.index.stride as usize).unwrap();
+                let mut blocks =
+                    decode_blocks_at(&m.stream, &restart, len, mt.is_chroma, mt.is_chroma, true)
+                        .expect("seek decode failed");
+                for (k, b) in blocks.iter_mut().enumerate() {
+                    dequantize_local(b, table);
+                    dct::idct(b);
+                    write_block_to_plane(b, &mut planes[pi], mt.pw, mt.ph, first + k);
+                }
+            }
+        }
+        planes_to_pixels(m.channels, &planes)
+    }
+
+    /// From-the-start decode of the whole stream: sequential Huffman decode of
+    /// every plane (the decoder's entropy path) plus the same post-processing.
+    fn full_decode(m: &EncodedMaterial) -> Vec<u8> {
+        let luma_q = encoder::quant_table_for_quality_perceptual_v4(QUALITY);
+        let chroma_q = encoder::chroma_quant_table_for_quality_perceptual_v4(QUALITY);
+        let mut planes: Vec<Vec<u8>> = m
+            .metas
+            .iter()
+            .map(|mt| vec![0u8; mt.pw * mt.ph])
+            .collect();
+        for (pi, mt) in m.metas.iter().enumerate() {
+            let table = if mt.is_chroma { &chroma_q } else { &luma_q };
+            let n_blocks = m.index.planes[pi].n_blocks as usize;
+            let (mut blocks, _) = decode_plane_with_profile(
+                &m.stream,
+                mt.file_pos,
+                n_blocks,
+                mt.is_chroma,
+                mt.is_chroma,
+                true,
+            )
+            .expect("full plane decode failed");
+            for (idx, b) in blocks.iter_mut().enumerate() {
+                dequantize_local(b, table);
+                dct::idct(b);
+                write_block_to_plane(b, &mut planes[pi], mt.pw, mt.ph, idx);
+            }
+        }
+        planes_to_pixels(m.channels, &planes)
+    }
+
+    fn planes_to_pixels(channels: usize, planes: &[Vec<u8>]) -> Vec<u8> {
+        let (w, h) = (W, H);
+        let mut out = vec![0u8; w * h * channels];
+        if channels == 3
+        {
+            colorspace::ycbcr420_to_rgb(&planes[0], &planes[1], &planes[2], w, h, &mut out);
+        } else {
+            colorspace::ycbcr420a_to_rgba(
+                &planes[0],
+                &planes[1],
+                &planes[2],
+                &planes[3],
+                w,
+                h,
+                &mut out,
+            );
+        }
+        out
+    }
+
+    // -- tests ----------------------------------------------------------------
+
+    /// The indexed encoder must produce a bitstream byte-identical to the
+    /// classic one (index recording is observation-only).
+    #[test]
+    fn indexed_encode_matches_classic_bitstream() {
+        let mut blocks = Vec::new();
+        let mut st = 0xdead_beefu64;
+        for _ in 0..50 {
+            let mut b = Block::new();
+            for v in b.data.iter_mut() {
+                *v = ((xorshift(&mut st) >> 20) as i16).clamp(-1023, 1023);
+            }
+            blocks.push(b);
+        }
+        for &(is_chroma, chroma_ac, dc_delta) in
+            &[(false, false, true), (true, true, true), (false, false, false)]
+        {
+            let classic = encode_plane_with_profile(&blocks, is_chroma, chroma_ac, dc_delta);
+            let (indexed, restarts) =
+                encode_plane_with_profile_indexed(&blocks, is_chroma, chroma_ac, dc_delta);
+            assert_eq!(classic, indexed);
+            assert_eq!(restarts.len(), blocks.len());
+        }
+    }
+
+    /// Corrupt indexes must be rejected by `BgIndex::parse`.
+    #[test]
+    fn index_corruption_is_detected() {
+        let m = encode_indexed("noise", &gen_noise(), 3);
+        let blob = m.index.serialize();
+        let parsed = BgIndex::parse(&blob).expect("valid index must parse");
+        assert_eq!(parsed, m.index);
+
+        // Flip every byte one at a time: each single-byte corruption must be caught.
+        for i in 0..blob.len() {
+            let mut bad = blob.clone();
+            bad[i] ^= 0x5A;
+            assert!(
+                BgIndex::parse(&bad).is_none(),
+                "corruption at byte {i} went undetected"
+            );
+        }
+        // Truncation must be caught.
+        for cut in [0, 1, 5, blob.len() / 2, blob.len() - 1] {
+            assert!(BgIndex::parse(&blob[..cut]).is_none());
+        }
+        // Garbage must be caught.
+        assert!(BgIndex::parse(&vec![0u8; 64]).is_none());
+    }
+
+    /// Full acceptance: four material types, index <= 2% of stream, seek decode
+    /// pixel-exact vs full decode, seek latency far below full decode.
+    #[test]
+    fn random_access_acceptance() {
+        let materials = vec![
+            encode_indexed("gradient-rgb", &gen_gradient(), 3),
+            encode_indexed("noise-rgb", &gen_noise(), 3),
+            encode_indexed("edges-rgb", &gen_edges(), 3),
+            encode_indexed("photo-rgba", &gen_photo_rgba(), 4),
+        ];
+
+        println!("\n==== random-access index acceptance ({}x{}, q{}) ====", W, H, QUALITY);
+        println!(
+            "{:<14} {:>9} {:>8} {:>7} {:>7} {:>7} {:>11} {:>11} {:>8}",
+            "material", "stream B", "index B", "ratio%", "stride", "chunks",
+            "full us", "seek us", "speedup"
+        );
+
+        for m in &materials {
+            let blob = m.index.serialize();
+            let ratio = blob.len() as f64 * 100.0 / m.stream.len() as f64;
+            assert!(
+                blob.len() * 50 <= m.stream.len(),
+                "{}: index {} B exceeds 2% of stream {} B",
+                m.name,
+                blob.len(),
+                m.stream.len()
+            );
+
+            // Index round-trips through its serialized form; everything below
+            // runs against the *parsed* index, as a real consumer would.
+            let parsed = BgIndex::parse(&blob).expect("index must parse");
+            assert_eq!(parsed, m.index);
+            let m = &EncodedMaterial {
+                name: m.name,
+                channels: m.channels,
+                stream: m.stream.clone(),
+                index: parsed,
+                metas: m
+                    .metas
+                    .iter()
+                    .map(|p| PlaneMeta {
+                        pw: p.pw,
+                        ph: p.ph,
+                        is_chroma: p.is_chroma,
+                        file_pos: p.file_pos,
+                    })
+                    .collect(),
+            };
+
+            // 1) Coefficient-level: every seek-decoded chunk matches the
+            //    sequential Huffman decode exactly, block for block.
+            for (pi, mt) in m.metas.iter().enumerate() {
+                let n_blocks = m.index.planes[pi].n_blocks as usize;
+                let (ref_blocks, _) = decode_plane_with_profile(
+                    &m.stream,
+                    mt.file_pos,
+                    n_blocks,
+                    mt.is_chroma,
+                    mt.is_chroma,
+                    true,
+                )
+                .expect("reference plane decode failed");
+                let stride = m.index.stride as usize;
+                for ci in 0..m.index.planes[pi].entries.len() {
+                    let (restart, first, len) =
+                        m.index.locate(pi, ci * stride).expect("locate failed");
+                    let got = decode_blocks_at(
+                        &m.stream,
+                        &restart,
+                        len,
+                        mt.is_chroma,
+                        mt.is_chroma,
+                        true,
+                    )
+                    .expect("seek decode failed");
+                    for (k, b) in got.iter().enumerate() {
+                        assert_eq!(
+                            b.data, ref_blocks[first + k].data,
+                            "{}: plane {pi} block {} mismatch",
+                            m.name,
+                            first + k
+                        );
+                    }
+                }
+            }
+
+            // 2) Pixel-level: reassembled image from independent chunk decodes
+            //    is identical to a full decode.
+            let px_full = full_decode(m);
+            let px_seek = seek_decode_all(m);
+            assert_eq!(
+                px_full, px_seek,
+                "{}: seek-decoded pixels differ from full decode",
+                m.name
+            );
+
+            // 3) Timing: jumping to one chunk vs decoding the whole stream.
+            let full_iters = 50;
+            let t0 = Instant::now();
+            for _ in 0..full_iters {
+                std::hint::black_box(full_decode(m));
+            }
+            let full_us = t0.elapsed().as_micros() as f64 / full_iters as f64;
+
+            // Seek to the middle chunk of the luma plane and decode it
+            // (incl. dequant + IDCT), index already parsed.
+            let mid = m.index.planes[0].entries.len() / 2;
+            let (restart, _first, len) =
+                m.index.locate(0, mid * m.index.stride as usize).unwrap();
+            let luma_q = encoder::quant_table_for_quality_perceptual_v4(QUALITY);
+            let seek_iters = 500;
+            let t0 = Instant::now();
+            for _ in 0..seek_iters {
+                let mut blocks = decode_blocks_at(&m.stream, &restart, len, false, false, true)
+                    .expect("seek decode failed");
+                for b in blocks.iter_mut() {
+                    dequantize_local(b, &luma_q);
+                    dct::idct(b);
+                }
+                std::hint::black_box(&blocks);
+            }
+            let seek_us = t0.elapsed().as_micros() as f64 / seek_iters as f64;
+
+            let n_chunks: usize = m.index.planes.iter().map(|p| p.entries.len()).sum();
+            println!(
+                "{:<14} {:>9} {:>8} {:>6.2} {:>7} {:>7} {:>11.1} {:>11.2} {:>7.1}x",
+                m.name,
+                m.stream.len(),
+                blob.len(),
+                ratio,
+                m.index.stride,
+                n_chunks,
+                full_us,
+                seek_us,
+                full_us / seek_us
+            );
+            assert!(
+                seek_us * 4.0 < full_us,
+                "{}: seek decode not significantly faster ({seek_us:.1} us vs {full_us:.1} us)",
+                m.name
+            );
+        }
+        println!("all materials: pixel-exact seek decode, index <= 2% of stream, corruption detected\n");
+    }
+}
